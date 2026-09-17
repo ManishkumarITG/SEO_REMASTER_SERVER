@@ -1,0 +1,25 @@
+# Python वर्चुअल एनवायरमेंट फोल्डर
+venv/
+env/
+.venv/
+ENV/
+.env
+# pip इंस्टॉल से आने वाली अन्य फाइल्स
+bin/
+lib/
+share/
+include/
+
+# PyInstaller या बिल्ड फाइल्स (यदि लागू हो)
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg

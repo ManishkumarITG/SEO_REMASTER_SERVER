@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, ValidationError
 
+from integrations.google.gemini import GeminiResponseError, GeminiService, _strip_fences
 from services.backlinks.reddit_post_generator import (
     SYSTEM_INSTRUCTION,
     TITLE_MAX_CHARS,
@@ -24,7 +25,6 @@ from services.backlinks.reddit_post_generator import (
     validate_draft,
 )
 from services.backlinks.store_profile import StoreProduct, StoreProfile
-from services.integrations.gemini import GeminiResponseError, GeminiService, _strip_fences
 
 PROFILE = StoreProfile(
     store_url="https://shop.example.com/",

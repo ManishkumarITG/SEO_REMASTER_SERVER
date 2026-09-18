@@ -18,16 +18,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_settings
+from exceptions.backlinks import GuardrailError
 from models.db import RedditPost
-
-
-class GuardrailError(Exception):
-    """A local guardrail blocked the publish. `status_code` is the HTTP answer to give."""
-
-    def __init__(self, status_code: int, message: str) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
 
 
 def _as_utc(value: datetime | None) -> datetime | None:

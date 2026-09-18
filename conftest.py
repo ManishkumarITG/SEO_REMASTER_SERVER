@@ -1,4 +1,8 @@
-"""Pytest bootstrap: make app/server importable no matter where pytest is invoked from."""
+"""Pytest bootstrap: put server/ on sys.path so top-level imports resolve.
+
+Note: pytest must still be run FROM server/ - every import in the suite is
+top-level (`from services...`, `import main`), not package-relative.
+"""
 
 from __future__ import annotations
 

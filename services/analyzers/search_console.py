@@ -22,6 +22,12 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 
 from config import get_settings
+from db import mongo
+from integrations.google.oauth import (
+    execute_google_call,
+    get_search_console_service,
+    load_credentials,
+)
 from services.analyzers.base import (
     AnalyzerResult,
     BaseAnalyzer,
@@ -30,14 +36,8 @@ from services.analyzers.base import (
     score_from_findings,
 )
 from services.analyzers.registry import register_analyzer
-from services.cache import get_cache
 from services.crawler.parser import PageData
-from services.integrations import mongo
-from services.integrations.google_oauth import (
-    execute_google_call,
-    get_search_console_service,
-    load_credentials,
-)
+from utils.cache import get_cache
 
 LOOKBACK_DAYS = 28
 DATA_LAG_DAYS = 2  # Search Console data trails ~2 days

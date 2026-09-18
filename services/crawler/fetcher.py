@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from exceptions.crawler import FetchError
 from services.crawler.parser import PageData, parse_html
 
 logger = logging.getLogger("seo.crawler")
@@ -28,9 +29,6 @@ MAX_BYTES = 5 * 1024 * 1024
 #: robots.txt is a small text file; a multi-megabyte one is a trap, not a config.
 MAX_ROBOTS_BYTES = 512 * 1024
 
-
-class FetchError(Exception):
-    """Raised when a page cannot be fetched or is not auditable HTML."""
 
 
 async def read_capped(response: httpx.Response, max_bytes: int) -> tuple[bytes, bool]:

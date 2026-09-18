@@ -19,8 +19,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from exceptions.backlinks import DraftValidationError
+from integrations.google.gemini import GeminiService, get_gemini_service
 from services.backlinks.store_profile import StoreProfile
-from services.integrations.gemini import GeminiService, get_gemini_service
 
 logger = logging.getLogger("seo.backlinks.generator")
 
@@ -86,9 +87,6 @@ class RedditDraftSchema(BaseModel):
         description="One line per relevant rule and how the draft complies, or a warning",
     )
 
-
-class DraftValidationError(Exception):
-    """The generated draft breaks a hard limit. Surfaced to the UI, never truncated."""
 
 
 SYSTEM_INSTRUCTION = """\

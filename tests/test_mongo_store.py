@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-import services.integrations.mongo as mongo
+import db.mongo as mongo
 from config import get_settings
 
 TEST_DB = "seo_remaster_pytest"

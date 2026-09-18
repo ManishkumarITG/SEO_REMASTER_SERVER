@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from integrations.claude.llm import get_llm_service
 from services.analyzers.base import AnalyzerResult, BaseAnalyzer, Finding, Severity
 from services.analyzers.registry import register_analyzer
 from services.crawler.parser import PageData, extract_main_text
-from services.integrations.llm import get_llm_service
 
 _SYSTEM = (
     "You are an expert SEO content strategist. Analyze pages objectively and "

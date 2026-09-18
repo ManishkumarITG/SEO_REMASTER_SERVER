@@ -13,9 +13,10 @@ from datetime import UTC, datetime
 from sqlalchemy import update
 
 from db.session import async_session_factory
+from exceptions.crawler import FetchError
 from models.db import Audit
 from services.analyzers.registry import get_analyzers
-from services.crawler.fetcher import FetchError, fetch_page
+from services.crawler.fetcher import fetch_page
 from services.reports.scoring import build_report
 
 logger = logging.getLogger("seo.worker")

@@ -12,8 +12,8 @@ import pytest
 
 import workers.tasks as tasks
 from db.session import async_session_factory, init_db
+from exceptions.crawler import FetchError
 from models.db import Audit
-from services.crawler.fetcher import FetchError
 from tests.factories import GOOD_HTML, make_page
 
 

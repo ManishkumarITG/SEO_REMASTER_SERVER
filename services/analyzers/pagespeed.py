@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from integrations.google.pagespeed import fetch_pagespeed
 from services.analyzers.base import AnalyzerResult, BaseAnalyzer, Finding, Severity
 from services.analyzers.registry import register_analyzer
 from services.crawler.parser import PageData
-from services.integrations.pagespeed import fetch_pagespeed
 
 
 def _rate(value: float, good: float, poor: float) -> Severity:

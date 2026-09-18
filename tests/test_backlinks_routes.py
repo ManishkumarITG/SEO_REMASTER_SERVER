@@ -14,17 +14,17 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-import api.routes.backlinks as backlinks
 import main
+import services.backlinks.backlink_service as backlinks
 from config import get_settings
 from db.session import async_session_factory, init_db
-from models.db import RedditCredential, RedditPost, User
-from services.backlinks.reddit_post_generator import RedditDraftSchema
-from services.integrations.reddit import (
+from integrations.reddit.client import (
     RedditNotConfigured,
     RedditNotConnected,
     RedditRateLimited,
 )
+from models.db import RedditCredential, RedditPost, User
+from services.backlinks.reddit_post_generator import RedditDraftSchema
 
 DRAFT_PAYLOAD = {
     "store_url": "https://shop.example.com/",
@@ -111,7 +111,7 @@ def configured(monkeypatch: pytest.MonkeyPatch):
 def user_id(monkeypatch: pytest.MonkeyPatch) -> str:
     """A signed-in session, without going through the OAuth round-trip."""
     uid = str(uuid4())
-    monkeypatch.setattr(backlinks, "_require_user", lambda request: uid)
+    monkeypatch.setattr(backlinks, "require_user", lambda user_id: uid)
     return uid
 
 
@@ -395,7 +395,7 @@ async def test_dedupe_same_store_and_subreddit_returns_409(
 async def test_reddit_ratelimit_is_surfaced_verbatim_and_marks_the_row_failed(
     monkeypatch: pytest.MonkeyPatch, user_id: str
 ) -> None:
-    from services.integrations.reddit import RedditRateLimited
+    from integrations.reddit.client import RedditRateLimited
 
     await _seed_user(user_id)
     draft_id = await _seed_post(user_id)
@@ -419,7 +419,7 @@ async def test_reddit_ratelimit_is_surfaced_verbatim_and_marks_the_row_failed(
 async def test_reddit_refusal_becomes_502_with_reddits_message(
     monkeypatch: pytest.MonkeyPatch, user_id: str
 ) -> None:
-    from services.integrations.reddit import RedditAPIError
+    from integrations.reddit.client import RedditAPIError
 
     await _seed_user(user_id)
     draft_id = await _seed_post(user_id)

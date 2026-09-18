@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-import services.integrations.llm as llm_module
+import integrations.claude.llm as llm_module
 from services.analyzers.base import Severity
 from services.analyzers.content_ai import ContentAIAnalyzer
 from services.analyzers.registry import get_analyzers

@@ -22,7 +22,6 @@ import httpx
 from pydantic import BaseModel, Field
 from selectolax.parser import HTMLParser
 
-from services.cache import get_cache
 from services.crawler.fetcher import (
     TIMEOUT_SECONDS,
     USER_AGENT,
@@ -31,6 +30,7 @@ from services.crawler.fetcher import (
     read_capped,
 )
 from services.crawler.parser import PageData, extract_main_text
+from utils.cache import get_cache
 
 logger = logging.getLogger("seo.backlinks.store")
 

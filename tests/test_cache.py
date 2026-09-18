@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from services.cache import InMemoryTTLCache, RedisCache
+from utils.cache import InMemoryTTLCache, RedisCache
 
 
 async def test_hit_and_expiry(monkeypatch):
@@ -61,7 +61,7 @@ async def test_redis_outage_degrades_to_a_miss():
 
 
 async def test_redis_url_without_the_package_falls_back(monkeypatch):
-    import services.cache as cache_module
+    import utils.cache as cache_module
 
     monkeypatch.setattr(cache_module, "_cache", None)
     settings = cache_module.get_settings()
@@ -78,7 +78,7 @@ async def test_redis_url_without_the_package_falls_back(monkeypatch):
 
 @pytest.mark.parametrize("bad_url", ["redis://", "not-a-url"])
 async def test_malformed_redis_url_falls_back(monkeypatch, bad_url):
-    import services.cache as cache_module
+    import utils.cache as cache_module
 
     monkeypatch.setattr(cache_module, "_cache", None)
     settings = cache_module.get_settings()

@@ -13,7 +13,7 @@ import pytest
 import respx
 
 from config import get_settings
-from services.integrations.reddit import (
+from integrations.reddit.client import (
     OAUTH_BASE,
     TOKEN_URL,
     RedditAPIError,
@@ -290,7 +290,7 @@ async def test_link_flairs_403_returns_empty_list() -> None:
 
 @respx.mock
 async def test_subreddit_rules_flag_self_promo(monkeypatch: pytest.MonkeyPatch) -> None:
-    import services.cache as cache_module
+    import utils.cache as cache_module
 
     # Fresh cache so this test never reads another test's rules.
     monkeypatch.setattr(cache_module, "_cache", None)

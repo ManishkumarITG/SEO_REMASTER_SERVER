@@ -10,7 +10,8 @@ import httpx
 import pytest
 import respx
 
-from services.crawler.fetcher import MAX_BYTES, MAX_ROBOTS_BYTES, FetchError, fetch_page
+from exceptions.crawler import FetchError
+from services.crawler.fetcher import MAX_BYTES, MAX_ROBOTS_BYTES, fetch_page
 
 HTML = b"<!doctype html><html lang='en'><head><title>Hi</title></head><body><h1>Yo</h1></body></html>"
 

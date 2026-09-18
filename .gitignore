@@ -23,3 +23,11 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+# Python bytecode caches - these were tracked, which buried real diffs in .pyc churn
+__pycache__/
+*.py[cod]
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/

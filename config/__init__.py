@@ -7,6 +7,20 @@ reaches configuration. Nothing about how settings are loaded changed when
 `.env` file, same `@lru_cache` instance.
 """
 
-from config.settings import SERVER_DIR, Settings, get_settings, unknown_env_keys
+from config.settings import (
+    PLACEHOLDER_MARKERS,
+    SERVER_DIR,
+    Settings,
+    get_settings,
+    placeholder_env_values,
+    unknown_env_keys,
+)
 
-__all__ = ["SERVER_DIR", "Settings", "get_settings", "unknown_env_keys"]
+__all__ = [
+    "PLACEHOLDER_MARKERS",
+    "SERVER_DIR",
+    "Settings",
+    "get_settings",
+    "placeholder_env_values",
+    "unknown_env_keys",
+]

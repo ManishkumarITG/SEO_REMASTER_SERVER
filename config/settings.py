@@ -135,3 +135,36 @@ def unknown_env_keys() -> list[str]:
         if key and key.upper() not in fields and key not in unknown:
             unknown.append(key)
     return unknown
+
+
+#: Markers that mean "someone copied a template and never filled it in". Matched
+#: case-insensitively against every string-valued setting. Only key NAMES are ever
+#: logged - never the values, which are real secrets on a healthy install. The
+#: mongo marker is the full placeholder host rather than bare "xxxxx" so a real
+#: key that happens to contain five x's is never mistaken for a template.
+PLACEHOLDER_MARKERS: tuple[str, ...] = ("REPLACE_ME", "yourdomain.com", "USER:PASSWORD", "xxxxx.mongodb.net")
+
+
+def placeholder_env_values() -> list[str]:
+    """Settings whose value is still an unfilled template placeholder, by UPPER_CASE key.
+
+    `unknown_env_keys` catches a misspelled KEY. This catches a recognised key whose
+    VALUE was never filled in: `GOOGLE_REDIRECT_URI=https://api.yourdomain.com/...`
+    boots "successfully" and then fails at the first OAuth redirect with a Google
+    error page that says nothing about .env. Naming the key at startup turns a
+    twenty-minute hunt into a log line.
+    """
+    settings = get_settings()
+    flagged: list[str] = []
+    for name in Settings.model_fields:
+        value = getattr(settings, name, None)
+        if not isinstance(value, str) or not value:
+            continue
+        lowered = value.lower()
+        if any(marker.lower() in lowered for marker in PLACEHOLDER_MARKERS):
+            flagged.append(name.upper())
+        elif name == "reddit_user_agent" and "change_me" in lowered and settings.reddit_configured:
+            # The shipped default UA says CHANGE_ME on purpose. It is only a problem
+            # once Reddit is actually configured - and then Reddit throttles it.
+            flagged.append(name.upper())
+    return flagged

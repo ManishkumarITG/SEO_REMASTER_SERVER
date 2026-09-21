@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from config import get_settings, unknown_env_keys
+from config import get_settings, placeholder_env_values, unknown_env_keys
 from db.mongo import close_client as close_mongo_client
 from db.session import init_db
 from middleware import register_middleware
@@ -40,6 +40,16 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             "Ignoring %d unrecognised key(s) in server/.env: %s - "
             "these match no setting in config/settings.py and have no effect.",
             len(ignored), ", ".join(ignored),
+        )
+    placeholders = placeholder_env_values()
+    if placeholders:
+        # A recognised key holding a template value boots "successfully" and fails
+        # later with an error that never mentions .env - Google's
+        # redirect_uri_mismatch page, for one. Name the keys here instead. Never values.
+        logging.getLogger("seo").warning(
+            "%d setting(s) in server/.env still hold template placeholders: %s - "
+            "the feature each one configures will fail until it is filled in.",
+            len(placeholders), ", ".join(placeholders),
         )
     await init_db()  # dev convenience: auto-create tables (Alembic comes later)
     # Background tasks die with the process, so anything left "running" by the

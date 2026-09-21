@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
-from selectolax.parser import HTMLParser
-
 from services.analyzers.base import (
     AnalyzerResult,
     BaseAnalyzer,
@@ -14,17 +12,10 @@ from services.analyzers.base import (
     score_from_findings,
 )
 from services.analyzers.registry import register_analyzer
-from services.crawler.parser import PageData
+from services.crawler.parser import PageData, meta_by_name
 
 FAST_MS = 800.0
 SLOW_MS = 2500.0
-
-
-def _meta_by_name(dom: HTMLParser, name: str) -> str | None:
-    for node in dom.css("meta"):
-        if (node.attributes.get("name") or "").strip().lower() == name:
-            return node.attributes.get("content")
-    return None
 
 
 @register_analyzer
@@ -150,7 +141,7 @@ class TechnicalAnalyzer(BaseAnalyzer):
                 evidence={"url": page.robots_txt.get("url"), "status_code": robots_status}))
 
         # --- noindex (meta robots AND X-Robots-Tag header) ---------------------------
-        meta_robots = (_meta_by_name(dom, "robots") or "").lower()
+        meta_robots = (meta_by_name(dom, "robots") or "").lower()
         header_robots = page.headers.get("x-robots-tag", "").lower()
         noindex_sources: list[str] = []
         if "noindex" in meta_robots:
@@ -174,7 +165,7 @@ class TechnicalAnalyzer(BaseAnalyzer):
                 impact=1, effort=1))
 
         # --- Viewport -------------------------------------------------------------------
-        if (_meta_by_name(dom, "viewport") or "").strip():
+        if (meta_by_name(dom, "viewport") or "").strip():
             add(Finding(
                 id="technical.viewport", severity=Severity.PASSED,
                 title="Viewport meta present",

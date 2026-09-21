@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -66,3 +67,76 @@ def extract_main_text(dom: HTMLParser, max_chars: int = 8000) -> str:
     if " " in truncated:
         truncated = truncated.rsplit(" ", 1)[0]
     return truncated
+
+
+# --- Shared DOM lookups ---------------------------------------------------------
+#
+# These used to be private copies inside the on_page and technical analyzers and
+# the store profiler (three near-identical `_meta_by_name`s between them). One
+# home means a case-sensitivity or whitespace fix lands once, and the audit and
+# the catalog crawler can never disagree about whether a page has a description.
+#
+# Two return conventions, deliberately: the `meta_*` / `link_by_rel` helpers
+# return `None` when the tag is absent (the analyzers branch on that), while
+# `first_text` / `first_attr` return "" (the profiler/crawler feed the value
+# straight into string fields). Do not blur them.
+
+
+def meta_by_name(dom: HTMLParser, name: str) -> str | None:
+    """Content of <meta name="..."> (case-insensitive), or None when absent."""
+    wanted = name.strip().lower()
+    for node in dom.css("meta"):
+        if (node.attributes.get("name") or "").strip().lower() == wanted:
+            return node.attributes.get("content")
+    return None
+
+
+def meta_by_property(dom: HTMLParser, prop: str) -> str | None:
+    """Content of <meta property="..."> (case-insensitive), or None when absent."""
+    wanted = prop.strip().lower()
+    for node in dom.css("meta"):
+        if (node.attributes.get("property") or "").strip().lower() == wanted:
+            return node.attributes.get("content")
+    return None
+
+
+def link_by_rel(dom: HTMLParser, rel: str) -> str | None:
+    """href of the first <link> whose rel list contains `rel`, or None when absent."""
+    wanted = rel.strip().lower()
+    for node in dom.css("link[rel]"):
+        if wanted in (node.attributes.get("rel") or "").lower().split():
+            return node.attributes.get("href")
+    return None
+
+
+def first_text(dom: HTMLParser, selector: str) -> str:
+    """Whitespace-collapsed text of the first match, or "" when absent."""
+    node = dom.css_first(selector)
+    if node is None:
+        return ""
+    return " ".join((node.text() or "").split())
+
+
+def first_attr(dom: HTMLParser, selector: str, attribute: str) -> str:
+    """Whitespace-collapsed attribute of the first match, or "" when absent."""
+    node = dom.css_first(selector)
+    if node is None:
+        return ""
+    return " ".join((node.attributes.get(attribute, "") or "").split())
+
+
+#: selectolax joins text nodes with the separator, so "<b>linen</b>." becomes
+#: "linen ." - a stray space before punctuation on every description that has an
+#: inline tag. Undo it; nothing legitimate has whitespace before these characters
+#: or after an opening bracket.
+_SPACE_BEFORE_PUNCT = re.compile(r"\s+([.,;:!?%)\]])")
+_SPACE_AFTER_OPEN = re.compile(r"([(\[])\s+")
+
+
+def text_from_html_fragment(html: str, limit: int) -> str:
+    """Strip tags out of an HTML fragment (e.g. a Shopify body_html) into capped plain text."""
+    if not html:
+        return ""
+    text = " ".join(HTMLParser(html).text(separator=" ").split())
+    text = _SPACE_AFTER_OPEN.sub(r"\1", _SPACE_BEFORE_PUNCT.sub(r"\1", text))
+    return text[:limit].rstrip()

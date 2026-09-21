@@ -76,6 +76,20 @@ class Settings(BaseSettings):
     reddit_min_minutes_between_posts: int = 10
     reddit_dedupe_days: int = 30
 
+    # Store catalog crawler. Discovery is never capped; enrichment (one <head>
+    # fetch per item, ~0.2 s each) is, so a 10,000-product store finishes
+    # "partial" instead of holding a crawl slot for half an hour.
+    crawl_max_enrich_items: int = 2000
+    crawl_enrich_concurrency: int = 8
+    # Honest bot identity with a contact URL. Never a spoofed browser UA: several
+    # stores throttle named SEO bots specifically, and cloaking is a ToS breach.
+    crawler_user_agent: str = "SEOAnalyzerBot/0.1 (+https://github.com/seo-remaster/bot)"
+    # HTTP/2 lets an aborted head-only read keep its connection alive, which should
+    # matter for large catalogs. Measured on a 23-item crawl it made no difference
+    # (6.88 s vs 6.95 s), so it is opt-in: needs `pip install "httpx[http2]"` and
+    # silently falls back to HTTP/1.1 if h2 is absent.
+    crawl_http2: bool = False
+
     @property
     def cors_origin_list(self) -> list[str]:
         origins = {origin.strip() for origin in self.cors_origins.split(",") if origin.strip()}

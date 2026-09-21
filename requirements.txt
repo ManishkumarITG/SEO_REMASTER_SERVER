@@ -32,3 +32,6 @@ ruff>=0.6
 
 # optional: only needed if you set REDIS_URL
 # redis>=5.0
+
+# optional: HTTP/2 for the store catalog crawler (set CRAWL_HTTP2=true)
+# httpx[http2]>=0.27

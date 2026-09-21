@@ -18,8 +18,10 @@ from exceptions.reddit import (
     RedditNotConnected,
     RedditRateLimited,
 )
+from exceptions.stores import CatalogUnavailable, RobotsDisallowed
 
 __all__ = [
+    "CatalogUnavailable",
     "DraftValidationError",
     "FetchError",
     "GeminiError",
@@ -35,4 +37,5 @@ __all__ = [
     "RedditNotConfigured",
     "RedditNotConnected",
     "RedditRateLimited",
+    "RobotsDisallowed",
 ]

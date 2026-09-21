@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from urllib.parse import urljoin, urlsplit
 
-from selectolax.parser import HTMLParser
-
 from services.analyzers.base import (
     AnalyzerResult,
     BaseAnalyzer,
@@ -14,24 +12,24 @@ from services.analyzers.base import (
     score_from_findings,
 )
 from services.analyzers.registry import register_analyzer
-from services.crawler.parser import PageData, visible_text
+from services.crawler.parser import (
+    PageData,
+    link_by_rel,
+    meta_by_name,
+    meta_by_property,
+    visible_text,
+)
 
 _SKIP_HREF_PREFIXES = ("mailto:", "tel:", "javascript:", "data:")
 _OG_REQUIRED = ("og:title", "og:description", "og:image")
 
-
-def _meta_by_name(dom: HTMLParser, name: str) -> str | None:
-    for node in dom.css("meta"):
-        if (node.attributes.get("name") or "").strip().lower() == name:
-            return node.attributes.get("content")
-    return None
-
-
-def _meta_by_property(dom: HTMLParser, prop: str) -> str | None:
-    for node in dom.css("meta"):
-        if (node.attributes.get("property") or "").strip().lower() == prop:
-            return node.attributes.get("content")
-    return None
+#: Length bands for the two snippet fields. Module-level so the catalog crawler
+#: can import the SAME numbers - if it hardcoded its own, "too short" would mean
+#: one thing in an audit and another in the catalog view, and the two would drift.
+TITLE_MIN_CHARS = 30
+TITLE_MAX_CHARS = 60
+META_DESC_MIN_CHARS = 70
+META_DESC_MAX_CHARS = 160
 
 
 def _host(url: str) -> str:
@@ -62,14 +60,14 @@ class OnPageAnalyzer(BaseAnalyzer):
                 ),
                 recommendation="Add a unique, descriptive <title> of 30-60 characters that leads with the primary topic.",
                 impact=5, effort=1))
-        elif len(title) < 30:
+        elif len(title) < TITLE_MIN_CHARS:
             add(Finding(
                 id="on_page.title", severity=Severity.WARNING,
                 title=f"Title too short ({len(title)} chars)",
                 description="Titles under 30 characters usually waste ranking opportunity and look thin in search results.",
                 recommendation="Expand the title to 30-60 characters, adding the primary keyword and a differentiator.",
                 impact=3, effort=1, evidence={"title": title, "length": len(title)}))
-        elif len(title) > 60:
+        elif len(title) > TITLE_MAX_CHARS:
             add(Finding(
                 id="on_page.title", severity=Severity.WARNING,
                 title=f"Title too long ({len(title)} chars)",
@@ -85,7 +83,7 @@ class OnPageAnalyzer(BaseAnalyzer):
                 impact=1, effort=1, evidence={"title": title}))
 
         # --- Meta description --------------------------------------------
-        meta_desc = (_meta_by_name(dom, "description") or "").strip()
+        meta_desc = (meta_by_name(dom, "description") or "").strip()
         if not meta_desc:
             add(Finding(
                 id="on_page.meta_description", severity=Severity.WARNING,
@@ -93,7 +91,7 @@ class OnPageAnalyzer(BaseAnalyzer):
                 description="Without a meta description, search engines improvise a snippet, which usually lowers click-through rate.",
                 recommendation="Add a compelling meta description of 70-160 characters summarizing the page and its value.",
                 impact=4, effort=1))
-        elif not 70 <= len(meta_desc) <= 160:
+        elif not META_DESC_MIN_CHARS <= len(meta_desc) <= META_DESC_MAX_CHARS:
             add(Finding(
                 id="on_page.meta_description", severity=Severity.WARNING,
                 title=f"Meta description length off ({len(meta_desc)} chars)",
@@ -224,12 +222,7 @@ class OnPageAnalyzer(BaseAnalyzer):
                 impact=1, effort=1, evidence={"internal": internal, "external": external}))
 
         # --- Canonical ---------------------------------------------------------------
-        canonical = None
-        for node in dom.css("link[rel]"):
-            rel = (node.attributes.get("rel") or "").lower()
-            if "canonical" in rel.split():
-                canonical = node.attributes.get("href")
-                break
+        canonical = link_by_rel(dom, "canonical")
         if canonical:
             add(Finding(
                 id="on_page.canonical", severity=Severity.PASSED,
@@ -246,7 +239,7 @@ class OnPageAnalyzer(BaseAnalyzer):
                 impact=3, effort=1))
 
         # --- Open Graph -----------------------------------------------------------------
-        og_missing = [prop for prop in _OG_REQUIRED if not (_meta_by_property(dom, prop) or "").strip()]
+        og_missing = [prop for prop in _OG_REQUIRED if not (meta_by_property(dom, prop) or "").strip()]
         if og_missing:
             add(Finding(
                 id="on_page.open_graph", severity=Severity.WARNING,

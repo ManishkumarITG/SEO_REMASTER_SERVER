@@ -20,7 +20,6 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, Field
-from selectolax.parser import HTMLParser
 
 from services.crawler.fetcher import (
     TIMEOUT_SECONDS,
@@ -29,7 +28,13 @@ from services.crawler.fetcher import (
     fetch_page,
     read_capped,
 )
-from services.crawler.parser import PageData, extract_main_text
+from services.crawler.parser import (
+    PageData,
+    extract_main_text,
+    first_attr,
+    first_text,
+    text_from_html_fragment,
+)
 from utils.cache import get_cache
 
 logger = logging.getLogger("seo.backlinks.store")
@@ -86,22 +91,6 @@ def _origin_of(url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}"
 
 
-def _text_from_html(html: str, limit: int) -> str:
-    """Strip tags out of a Shopify body_html fragment."""
-    if not html:
-        return ""
-    text = " ".join(HTMLParser(html).text(separator=" ").split())
-    return text[:limit].rstrip()
-
-
-def _first(dom: HTMLParser, selector: str, attribute: str | None = None) -> str:
-    node = dom.css_first(selector)
-    if node is None:
-        return ""
-    value = node.attributes.get(attribute, "") if attribute else node.text()
-    return " ".join((value or "").split())
-
-
 async def _fetch_products_json(origin: str) -> tuple[list[StoreProduct], list[str], str]:
     """Read up to 12 products from /products.json. Any failure is non-fatal."""
     url = f"{origin}/products.json"
@@ -143,7 +132,7 @@ async def _fetch_products_json(origin: str) -> tuple[list[StoreProduct], list[st
                 title=str(item.get("title") or "").strip(),
                 product_type=str(item.get("product_type") or "").strip(),
                 vendor=str(item.get("vendor") or "").strip(),
-                blurb=_text_from_html(str(item.get("body_html") or ""), _PRODUCT_BLURB_CHARS),
+                blurb=text_from_html_fragment(str(item.get("body_html") or ""), _PRODUCT_BLURB_CHARS),
                 price=price,
                 url=f"{origin}/products/{handle}" if handle else None,
             )
@@ -158,10 +147,10 @@ async def _fetch_products_json(origin: str) -> tuple[list[StoreProduct], list[st
 
 def _profile_from_page(store_url: str, page: PageData) -> StoreProfile:
     dom = page.dom
-    title = _first(dom, "title")
-    meta_description = _first(dom, 'meta[name="description"]', "content")
-    h1 = _first(dom, "h1")
-    site_name = _first(dom, 'meta[property="og:site_name"]', "content")
+    title = first_text(dom, "title")
+    meta_description = first_attr(dom, 'meta[name="description"]', "content")
+    h1 = first_text(dom, "h1")
+    site_name = first_attr(dom, 'meta[property="og:site_name"]', "content")
     # "Store — tagline" / "Store | tagline": the part before the separator is the name.
     store_name = site_name or next((part.strip() for part in title.split("|") if part.strip()), "")
     if not store_name:

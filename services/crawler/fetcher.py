@@ -12,6 +12,7 @@ import httpx
 
 from exceptions.crawler import FetchError
 from services.crawler.parser import PageData, parse_html
+from services.crawler.robots import parse_robots
 
 logger = logging.getLogger("seo.crawler")
 
@@ -127,6 +128,7 @@ async def _fetch_robots(client: httpx.AsyncClient, final_url: str) -> dict[str, 
         "disallow": [],
         "allow": [],
         "sitemaps": [],
+        "crawl_delay": None,
     }
     try:
         async with client.stream("GET", robots_url, timeout=5.0) as response:
@@ -138,22 +140,5 @@ async def _fetch_robots(client: httpx.AsyncClient, final_url: str) -> dict[str, 
             text = _decode(response, body)
     except httpx.HTTPError:
         return info
-    _parse_robots(text, info)
+    parse_robots(text, info)
     return info
-
-
-def _parse_robots(text: str, info: dict[str, Any]) -> None:
-    applies_to_all = False
-    for raw_line in text.splitlines()[:500]:
-        line = raw_line.split("#", 1)[0].strip()
-        if not line or ":" not in line:
-            continue
-        directive, _, value = line.partition(":")
-        directive = directive.strip().lower()
-        value = value.strip()
-        if directive == "user-agent":
-            applies_to_all = value == "*"
-        elif directive == "sitemap":
-            info["sitemaps"].append(value)
-        elif applies_to_all and directive in ("disallow", "allow") and value:
-            info[directive].append(value)

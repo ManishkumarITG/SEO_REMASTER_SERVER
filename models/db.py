@@ -120,3 +120,57 @@ class RedditPost(Base):
     auto_published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class StoreCrawl(Base):
+    """One catalog crawl of one store. The client polls this row for progress.
+
+    Job state deliberately lives in SQL, not MongoDB: Mongo writes are best-effort
+    in this codebase, and a crawl the client cannot poll is worse than a crawl
+    whose catalog was not kept. The catalog itself lives in MongoDB
+    (db/store_catalog.py), keyed by store_domain.
+
+    Every counter ships in v1 on purpose. db/session.py::_add_missing_columns can
+    only ALTER TABLE ADD a column that is nullable or has a server_default, and
+    `Integer, nullable=False, default=0` is a Python-side default that does NOT
+    qualify - a counter added later must be nullable and read as `row.x or 0`.
+    """
+
+    __tablename__ = "store_crawls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    store_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    #: Lowercased host without "www." - the MongoDB catalog identity. Denormalised
+    #: onto the row so the read endpoints never re-derive it with different rules.
+    store_domain: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    store_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: Session user that asked, when known. Nullable and deliberately NOT a
+    #: foreign key, for the same reason as Audit.user_id: most sessions have no
+    #: user_id (it is only set after an OAuth round trip).
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    #: pending | discovering | enriching | complete | partial | failed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    #: products_json | sitemap | mixed | none ("none" = discovery never finished)
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="none")
+    products_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    products_enriched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    collections_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    collections_enriched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Items phase 2 tried and could not read a <head> for.
+    enrich_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Items phase 2 never attempted because MAX_ENRICH_ITEMS or the deadline bound first.
+    enrich_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Docs MongoDB accepted. 0 with status "complete" means Mongo was down - the
+    #: crawl ran, the catalog was not kept. persistence_ok says so explicitly.
+    items_persisted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    revisions_written: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    persistence_ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    #: Shop-name suffix inferred from the titles, e.g. "clean eatz kitchen".
+    shop_suffix: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: Per-flag item counts at completion, e.g. {"meta_title_is_default": 3}.
+    flag_counts: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    #: Phase 1 finished - the catalog is readable while phase 2 still runs.
+    discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

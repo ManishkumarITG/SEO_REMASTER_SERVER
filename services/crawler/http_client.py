@@ -39,8 +39,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from services.crawler.fetcher import MAX_REDIRECTS, USER_AGENT, _decode, read_capped
+from services.crawler.fetcher import MAX_REDIRECTS, MAX_ROBOTS_BYTES, USER_AGENT, _decode, read_capped
 from services.crawler.parser import first_attr, first_text, meta_by_property, parse_html
+from services.crawler.robots import RobotsRules, parse_robots
 from services.stores.models import OriginInfo
 
 logger = logging.getLogger("seo.crawler.http")
@@ -156,6 +157,11 @@ class HttpResult:
     elapsed_ms: float = 0.0
     error: str = ""
     redirect_chain: list[str] = field(default_factory=list)
+    #: Lower-cased response headers. Carried because `X-Robots-Tag: noindex` is
+    #: invisible in the body: `analyzers/technical.py` already reads it off
+    #: `PageData.headers`, and a site-wide crawl that ignored it would report a
+    #: de-indexed page as indexable.
+    headers: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -233,6 +239,7 @@ async def get_capped(
             result.final_url = str(response.url)
             result.redirect_chain = [str(r.url) for r in response.history]
             result.content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+            result.headers = {k.lower(): v for k, v in response.headers.items()}
             if sentinels:
                 body, hit, truncated = await read_until_sentinel(response, max_bytes, sentinels)
                 result.stopped_early = hit
@@ -289,6 +296,29 @@ async def get_head_html(client: httpx.AsyncClient, url: str, *, max_bytes: int =
     """Read a page only as far as its <head>."""
     return await get_capped(client, url, max_bytes=max_bytes, sentinels=HEAD_SENTINELS,
                             accept="text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
+
+
+# --- robots.txt -----------------------------------------------------------------
+
+
+async def fetch_robots(client: httpx.AsyncClient, origin: str) -> RobotsRules:
+    """Fetch and parse robots.txt ONCE per crawl. Unreadable -> permissive.
+
+    Moved here from `services/stores/discovery.py` (which re-imports it) when the
+    site-wide crawler needed the same call. Both crawls must agree on what
+    "unreadable robots.txt" means, and two copies of this function are two
+    chances to disagree.
+    """
+    result = await get_text(client, f"{origin}/robots.txt", max_bytes=MAX_ROBOTS_BYTES)
+    if result.error or result.status_code != 200:
+        rules = RobotsRules.permissive()
+        rules.fetched = not result.error
+        rules.status_code = result.status_code
+        return rules
+    info: dict[str, Any] = {"disallow": [], "allow": [], "sitemaps": [], "crawl_delay": None,
+                            "fetched": True, "status_code": 200}
+    parse_robots(result.text, info)
+    return RobotsRules.from_info(info)
 
 
 # --- Origin resolution ----------------------------------------------------------

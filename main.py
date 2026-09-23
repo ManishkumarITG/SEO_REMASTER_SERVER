@@ -25,7 +25,11 @@ from db.mongo import close_client as close_mongo_client
 from db.session import init_db
 from middleware import register_middleware
 from routes import register_routes
-from workers.tasks import reconcile_orphaned_audits, reconcile_orphaned_crawls
+from workers.tasks import (
+    reconcile_orphaned_audits,
+    reconcile_orphaned_crawls,
+    reconcile_orphaned_site_crawls,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -56,6 +60,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     # previous run (or the last --reload) will never finish. Close those out.
     await reconcile_orphaned_audits()
     await reconcile_orphaned_crawls()
+    await reconcile_orphaned_site_crawls()
     yield
     await close_mongo_client()
 

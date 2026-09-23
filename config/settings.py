@@ -90,6 +90,26 @@ class Settings(BaseSettings):
     # silently falls back to HTTP/1.1 if h2 is absent.
     crawl_http2: bool = False
 
+    # Site-wide crawl (services/crawler/site_crawl.py). Separate knobs from the
+    # store catalog crawl above: this one fetches whole pages and discovers its
+    # own frontier, so it is bounded by pages AND depth AND wall clock, and it
+    # paces itself more slowly than a <head>-only pass.
+    site_crawl_max_pages: int = 500
+    site_crawl_max_depth: int = 5
+    site_crawl_concurrency: int = 6
+    site_crawl_deadline_s: int = 10 * 60
+    #: Floor between request starts. robots Crawl-delay raises it, never lowers it.
+    site_crawl_min_interval_s: float = 0.1
+    #: Off by default: a crawl seeded at example.com that wanders into
+    #: shop.example.com is usually a surprise, not a feature.
+    site_crawl_include_subdomains: bool = False
+    # Analyzers run once per crawled page. Only the two that read the DOM they
+    # are handed belong here: pagespeed, content_ai and search_console each make
+    # their own outbound call, so at 500 pages they would mean 500 Lighthouse
+    # runs or 500 LLM completions. services/site_crawl_analysis.py refuses any
+    # name outside its bulk-safe set. Empty string turns page scoring off.
+    site_crawl_analyzers: str = "on_page,technical"
+
     @property
     def cors_origin_list(self) -> list[str]:
         origins = {origin.strip() for origin in self.cors_origins.split(",") if origin.strip()}

@@ -1,0 +1,326 @@
+"""Site-wide crawl service: the HTTP-facing layer.
+
+Create-then-schedule mirrors store_crawl_service.py and audit_service.py: the row
+is committed BEFORE the background task is registered, because the worker
+re-fetches it by id on its own session. Only the id crosses into the worker.
+
+The POST runs a synchronous pre-flight (two small requests) so an unreachable
+site answers 422 and a robots-blocked one 403 immediately, instead of a job that
+fails two seconds later. The crawl itself happens in the worker, so endpoint
+latency is independent of site size. The worker re-probes rather than receiving
+the probe object, keeping the "only the id crosses" rule.
+
+Reads: 404 for an unknown crawl id or absent page, and 503 with the SAME string
+store_crawl_service uses when MongoDB is unreachable, so the frontend error
+handling stays uniform. No 401 anywhere: crawls are anonymous-friendly, as the
+catalog crawls are.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import BackgroundTasks, HTTPException
+from pymongo.errors import PyMongoError
+from sqlalchemy import desc, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from config import get_settings
+from db import site_pages
+from exceptions.crawler import FetchError
+from exceptions.stores import RobotsDisallowed
+from models.db import SiteCrawl
+from schemas import (
+    SiteCrawlCreatedResponse,
+    SiteCrawlCreateRequest,
+    SiteCrawlIssuesResponse,
+    SiteCrawlListResponse,
+    SiteCrawlPageDetail,
+    SiteCrawlPagesResponse,
+    SiteCrawlStatusResponse,
+    SiteCrawlSummary,
+    page_from_doc,
+)
+from services.crawler.http_client import crawl_client
+from services.crawler.models import CrawlLimits
+from services.crawler.site_crawl import probe_site
+from services.crawler.urls import host_of
+from services.reports.scoring import grade_for
+from workers.tasks import run_site_crawl
+
+logger = logging.getLogger("seo.site_crawl")
+
+_TERMINAL = ("complete", "partial", "failed")
+#: Cap on the orphan list in the issues response. The COUNT is always exact; a
+#: site with 4,000 orphans has one problem, not 4,000, and the paged
+#: `?issue=orphan` endpoint is there for the full list.
+MAX_ORPHANS_LISTED = 200
+
+
+def _mongo_503(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=503, detail=f"MongoDB unavailable: {type(exc).__name__}")
+
+
+def _progress_pct(row: SiteCrawl) -> int:
+    """0-100. A fraction of the page BUDGET, because the real total is unknowable.
+
+    A crawl discovers its own work: until it ends, nobody knows how many pages
+    the site has. Showing "47 of 500 allowed" is honest; showing "47 of 47 found
+    so far" would sit at 100% from the first page.
+    """
+    if row.status in _TERMINAL:
+        return 100
+    if row.status == "pending":
+        return 0
+    budget = max(row.max_pages, 1)
+    return min(99, max(1, int(100 * row.pages_fetched / budget)))
+
+
+def _status_response(row: SiteCrawl) -> SiteCrawlStatusResponse:
+    return SiteCrawlStatusResponse(
+        crawl_id=row.id,
+        start_url=row.start_url,
+        host=row.host,
+        site_name=row.site_name,
+        status=row.status,  # type: ignore[arg-type]
+        max_pages=row.max_pages,
+        max_depth=row.max_depth,
+        pages_discovered=row.pages_discovered,
+        pages_fetched=row.pages_fetched,
+        pages_ok=row.pages_ok,
+        client_errors=row.client_errors,
+        server_errors=row.server_errors,
+        transport_errors=row.transport_errors,
+        skipped_by_robots=row.skipped_by_robots,
+        skipped_asset=row.skipped_asset,
+        skipped_non_html=row.skipped_non_html,
+        skipped_off_site=row.skipped_off_site,
+        beyond_depth=row.beyond_depth,
+        not_attempted=row.not_attempted,
+        seeded_from_sitemap=row.seeded_from_sitemap,
+        max_depth_seen=row.max_depth_seen,
+        progress_pct=_progress_pct(row),
+        hit_page_budget=row.hit_page_budget,
+        deadline_hit=row.deadline_hit,
+        aborted_reason=row.aborted_reason,
+        orphan_count=row.orphan_count,
+        noindex_count=row.noindex_count,
+        missing_title_count=row.missing_title_count,
+        missing_description_count=row.missing_description_count,
+        broken_page_count=row.broken_page_count,
+        # `or 0` because these four were added after the table existed and are
+        # therefore nullable - see the note on models.db.SiteCrawl.
+        page_types=[t for t in (row.page_types or "").split(",") if t],
+        target_pages=row.target_pages or 0,
+        navigation_pages=row.navigation_pages or 0,
+        skipped_page_type=row.skipped_page_type or 0,
+        pages_analyzed=row.pages_analyzed or 0,
+        avg_score=row.avg_score,
+        grade=grade_for(row.avg_score) if row.avg_score is not None else None,
+        critical_findings=row.critical_findings or 0,
+        warning_findings=row.warning_findings or 0,
+        pages_persisted=row.pages_persisted,
+        persistence_ok=row.persistence_ok,
+        notes=[str(note) for note in (row.notes or [])],
+        elapsed_s=row.elapsed_s,
+        error=row.error_message,
+        created_at=row.created_at,
+        started_at=row.started_at,
+        completed_at=row.completed_at,
+    )
+
+
+def _summary(row: SiteCrawl) -> SiteCrawlSummary:
+    return SiteCrawlSummary(
+        crawl_id=row.id,
+        start_url=row.start_url,
+        host=row.host,
+        site_name=row.site_name,
+        status=row.status,  # type: ignore[arg-type]
+        pages_fetched=row.pages_fetched,
+        pages_ok=row.pages_ok,
+        orphan_count=row.orphan_count,
+        broken_page_count=row.broken_page_count,
+        avg_score=row.avg_score,
+        grade=grade_for(row.avg_score) if row.avg_score is not None else None,
+        page_types=[t for t in (row.page_types or "").split(",") if t],
+        target_pages=row.target_pages or 0,
+        created_at=row.created_at,
+        completed_at=row.completed_at,
+        error=row.error_message,
+    )
+
+
+def _requested_options(payload: SiteCrawlCreateRequest) -> dict[str, Any]:
+    """The bound overrides the caller actually sent, omitting the ones left None.
+
+    Stored on the row so the worker rebuilds the same limits, and so a report can
+    say what was asked for rather than what the defaults happen to be today.
+    """
+    options: dict[str, Any] = {
+        name: value
+        for name, value in (
+            ("include_subdomains", payload.include_subdomains),
+            ("follow_nofollow", payload.follow_nofollow),
+            ("seed_from_sitemap", payload.seed_from_sitemap),
+            ("max_navigation_pages", payload.max_navigation_pages),
+        )
+        if value is not None
+    }
+    if payload.page_types:
+        # Deduped and ordered here so the row, the worker and the report all show
+        # the same string for the same request.
+        options["page_types"] = [t for t in ("product", "collection") if t in payload.page_types]
+    return options
+
+
+async def _require_crawl(crawl_id: str, session: AsyncSession) -> SiteCrawl:
+    row = await session.get(SiteCrawl, crawl_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Site crawl {crawl_id} not found")
+    return row
+
+
+# --- crawls -------------------------------------------------------------------------
+
+
+async def create_site_crawl(
+    payload: SiteCrawlCreateRequest,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession,
+    user_id: str | None,
+) -> SiteCrawlCreatedResponse:
+    start_url = payload.start_url
+    host = host_of(start_url)
+    if not host:
+        raise HTTPException(status_code=422, detail="start_url must include a host")
+
+    # Duplicate-crawl guard: a double-clicked button must not start a second
+    # multi-minute job against the same site. Hand back the one already running.
+    in_flight = await session.scalar(
+        select(SiteCrawl)
+        .where(SiteCrawl.host == host, SiteCrawl.status.notin_(_TERMINAL))
+        .order_by(desc(SiteCrawl.created_at))
+        .limit(1)
+    )
+    if in_flight is not None:
+        return SiteCrawlCreatedResponse(
+            crawl_id=in_flight.id, start_url=in_flight.start_url, host=host,
+            status=in_flight.status, reused=True,  # type: ignore[arg-type]
+        )
+
+    settings = get_settings()
+    try:
+        async with crawl_client(user_agent=settings.crawler_user_agent, http2=settings.crawl_http2) as client:
+            probe = await probe_site(client, start_url)
+    except RobotsDisallowed as exc:
+        raise HTTPException(status_code=403, detail=exc.message) from exc
+    except FetchError as exc:
+        raise HTTPException(status_code=422, detail=f"Could not reach the site: {exc}") from exc
+
+    options = _requested_options(payload)
+    limits = CrawlLimits.from_settings(
+        settings,
+        **({"max_pages": payload.max_pages} if payload.max_pages is not None else {}),
+        **({"max_depth": payload.max_depth} if payload.max_depth is not None else {}),
+        **options,
+    )
+
+    row = SiteCrawl(
+        start_url=probe.start_url,
+        host=probe.host,
+        site_name=probe.site_name[:255] or None,
+        user_id=user_id,
+        status="pending",
+        max_pages=limits.max_pages,
+        max_depth=limits.max_depth,
+        page_types=",".join(limits.page_types) or None,
+        options=options or None,
+    )
+    session.add(row)
+    await session.commit()
+    background_tasks.add_task(run_site_crawl, row.id)
+    return SiteCrawlCreatedResponse(
+        crawl_id=row.id, start_url=row.start_url, host=row.host, status="pending"
+    )
+
+
+async def get_site_crawl(crawl_id: str, session: AsyncSession) -> SiteCrawlStatusResponse:
+    return _status_response(await _require_crawl(crawl_id, session))
+
+
+async def list_site_crawls(
+    session: AsyncSession, *, host: str | None, limit: int
+) -> SiteCrawlListResponse:
+    conditions = [SiteCrawl.host == host] if host else []
+    total = await session.scalar(select(func.count()).select_from(SiteCrawl).where(*conditions)) or 0
+    rows = await session.scalars(
+        select(SiteCrawl).where(*conditions).order_by(desc(SiteCrawl.created_at)).limit(limit)
+    )
+    return SiteCrawlListResponse(crawls=[_summary(row) for row in rows], total=total)
+
+
+# --- pages ---------------------------------------------------------------------------
+
+
+async def get_site_crawl_pages(
+    crawl_id: str,
+    session: AsyncSession,
+    *,
+    limit: int,
+    offset: int,
+    sort: str,
+    issue: str | None,
+    include_navigation: bool = False,
+) -> SiteCrawlPagesResponse:
+    row = await _require_crawl(crawl_id, session)
+    try:
+        docs, total = await site_pages.load_pages(
+            crawl_id, limit=limit, offset=offset, sort=sort, issue=issue,
+            include_navigation=include_navigation,
+        )
+    except PyMongoError as exc:
+        raise _mongo_503(exc) from exc
+    return SiteCrawlPagesResponse(
+        crawl_id=crawl_id,
+        host=row.host,
+        pages=[page_from_doc(doc) for doc in docs],
+        total=total,
+        limit=limit,
+        offset=offset,
+        issue=issue,
+        include_navigation=include_navigation,
+    )
+
+
+async def get_site_crawl_page(crawl_id: str, url: str, session: AsyncSession) -> SiteCrawlPageDetail:
+    await _require_crawl(crawl_id, session)
+    try:
+        doc = await site_pages.load_page(crawl_id, url)
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"{url} is not in crawl {crawl_id}")
+        inlinks = await site_pages.load_inlinks(crawl_id, url)
+    except PyMongoError as exc:
+        raise _mongo_503(exc) from exc
+    fields = SiteCrawlPageDetail.model_fields
+    known = {k: v for k, v in doc.items() if k in fields and k != "inlinks"}
+    return SiteCrawlPageDetail(**known, inlinks=inlinks)
+
+
+async def get_site_crawl_issues(crawl_id: str, session: AsyncSession) -> SiteCrawlIssuesResponse:
+    row = await _require_crawl(crawl_id, session)
+    try:
+        counts = await site_pages.issue_counts(crawl_id)
+        orphans, orphan_total = await site_pages.load_orphans(crawl_id, MAX_ORPHANS_LISTED)
+    except PyMongoError as exc:
+        raise _mongo_503(exc) from exc
+    return SiteCrawlIssuesResponse(
+        crawl_id=crawl_id,
+        host=row.host,
+        status=row.status,  # type: ignore[arg-type]
+        counts=counts,
+        orphans=orphans,
+        orphan_count=orphan_total,
+        orphans_truncated=orphan_total > len(orphans),
+    )

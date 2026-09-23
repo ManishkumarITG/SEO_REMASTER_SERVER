@@ -12,17 +12,16 @@ The two loops run and fall back INDEPENDENTLY - some stores 404 /collections.jso
 while still serving every /collections/<handle> page - so `source="mixed"` is a
 legitimate outcome.
 
-Sitemap XML is parsed with a bounded regex over <loc>, on purpose. The XML comes
-from a user-supplied host. XXE is not reachable on CPython 3.12, but
-entity-expansion DoS is - expat expands inline DOCTYPE entities with no limit and
-the byte cap bounds input, not the blowup. We need one thing: the text of <loc>.
-This is token extraction from an untrusted document, not parsing.
+Sitemap <loc> extraction moved to `services/crawler/sitemap.py` (re-exported
+here, so `from services.stores.discovery import parse_sitemap_locs` still works)
+once the site-wide crawler needed it too. Its docstring carries the reasoning for
+the deliberate regex - the XML comes from a user-supplied host and
+entity-expansion DoS is reachable through a real XML parser.
 """
 
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import re
 from decimal import Decimal, InvalidOperation
@@ -33,15 +32,17 @@ import httpx
 
 from exceptions.crawler import FetchError
 from exceptions.stores import CatalogUnavailable, RobotsDisallowed
-from services.crawler.fetcher import MAX_ROBOTS_BYTES
 from services.crawler.http_client import (
+    fetch_robots,
     get_json,
     get_text,
     is_public_host,
     resolve_origin,
 )
 from services.crawler.parser import text_from_html_fragment
-from services.crawler.robots import RobotsRules, parse_robots
+from services.crawler.robots import RobotsRules
+from services.crawler.sitemap import parse_sitemap_locs
+from services.crawler.urls import classify_catalog_url, handle_ok
 from services.stores.models import CatalogItem, DiscoveryResult, OriginInfo, ProbeResult
 
 logger = logging.getLogger("seo.stores.discovery")
@@ -54,33 +55,12 @@ MAX_COLLECTION_PAGES = 8
 MAX_PRODUCTS = 10_000
 MAX_COLLECTIONS = 2_000
 MAX_SUB_SITEMAPS = 20
-MAX_SITEMAP_LOCS = 50_000
 DESCRIPTION_CHARS = 2_000
 #: Only status matters for the probe; read a sliver.
 PROBE_BYTES = 16 * 1024
 
-_HANDLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
-#: Linear, no nested quantifiers - cannot backtrack catastrophically.
-_LOC_RE = re.compile(r"<loc\b[^>]*>(.*?)</loc>", re.IGNORECASE | re.DOTALL)
 #: A path segment like "es-US" or "fr" before "sitemap_" marks a locale duplicate.
 _LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[A-Za-z]{2})?$")
-
-
-# --- robots -------------------------------------------------------------------------
-
-
-async def fetch_robots(client: httpx.AsyncClient, origin: str) -> RobotsRules:
-    """Fetch and parse robots.txt ONCE per crawl. Unreadable -> permissive."""
-    result = await get_text(client, f"{origin}/robots.txt", max_bytes=MAX_ROBOTS_BYTES)
-    if result.error or result.status_code != 200:
-        rules = RobotsRules.permissive()
-        rules.fetched = not result.error
-        rules.status_code = result.status_code
-        return rules
-    info: dict[str, Any] = {"disallow": [], "allow": [], "sitemaps": [], "crawl_delay": None,
-                            "fetched": True, "status_code": 200}
-    parse_robots(result.text, info)
-    return RobotsRules.from_info(info)
 
 
 # --- probe (synchronous, in the POST) ----------------------------------------------
@@ -185,10 +165,6 @@ async def _paginate(
     return rows, pages, notes, False, False
 
 
-def _handle_ok(handle: Any) -> bool:
-    return isinstance(handle, str) and bool(_HANDLE_RE.match(handle))
-
-
 def _decimal(value: Any) -> Decimal | None:
     try:
         return Decimal(str(value))
@@ -222,7 +198,7 @@ def _parse_dt(value: Any):
 
 def product_from_json(origin: str, raw: dict[str, Any], *, currency: str = "") -> CatalogItem | None:
     handle = raw.get("handle")
-    if not _handle_ok(handle):
+    if not handle_ok(handle):
         return None
     variants = [v for v in (raw.get("variants") or []) if isinstance(v, dict)]
     prices = [d for d in (_decimal(v.get("price")) for v in variants) if d is not None]
@@ -255,7 +231,7 @@ def product_from_json(origin: str, raw: dict[str, Any], *, currency: str = "") -
 
 def collection_from_json(origin: str, raw: dict[str, Any]) -> CatalogItem | None:
     handle = raw.get("handle")
-    if not _handle_ok(handle):
+    if not handle_ok(handle):
         return None
     image_url, image_alt = _featured_image(raw.get("image"))
     count = raw.get("products_count")
@@ -307,18 +283,6 @@ async def _discover_json(
 # --- tier 2: sitemap ---------------------------------------------------------------------
 
 
-def parse_sitemap_locs(xml_text: str, *, limit: int = MAX_SITEMAP_LOCS) -> list[str]:
-    """Every <loc> value, unescaped, in document order, capped. Never parses XML."""
-    locs: list[str] = []
-    for match in _LOC_RE.finditer(xml_text):
-        value = html.unescape(match.group(1)).strip()
-        if value:
-            locs.append(value)
-            if len(locs) >= limit:
-                break
-    return locs
-
-
 def _same_host(origin: str, url: str) -> bool:
     return (urlsplit(url).hostname or "").lower() == (urlsplit(origin).hostname or "").lower()
 
@@ -326,18 +290,6 @@ def _same_host(origin: str, url: str) -> bool:
 def _is_locale_sitemap(url: str) -> bool:
     segments = [s for s in urlsplit(url).path.split("/") if s]
     return len(segments) >= 2 and bool(_LOCALE_SEGMENT_RE.match(segments[0])) and "sitemap" in segments[-1].lower()
-
-
-def classify_catalog_url(url: str) -> str | None:
-    """"product" | "collection" | None from the path shape alone (works on non-Shopify too)."""
-    segments = [s for s in urlsplit(url).path.split("/") if s]
-    if len(segments) == 2 and segments[0] == "products" and _handle_ok(segments[1]):
-        return "product"
-    if len(segments) == 2 and segments[0] == "collections" and _handle_ok(segments[1]):
-        if segments[1].lower() in ("all", "frontpage"):
-            return None  # Shopify's virtual collections, not real ones
-        return "collection"
-    return None
 
 
 def item_from_url(kind: str, url: str) -> CatalogItem:

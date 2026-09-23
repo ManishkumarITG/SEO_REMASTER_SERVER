@@ -16,8 +16,9 @@ shaped by three measured facts:
 Politeness is not optional here - we make hundreds of unattended requests to a
 third party. robots.txt is honoured (wildcards and all), Crawl-delay is used as
 the floor between requests but clamped, 429/503 back off, and five consecutive
-429s abort the pass. Never retain the page HTML on an item: 5,000 x 90 KiB is
-450 MB.
+429s abort the pass. The pacing itself is `services/crawler/throttle.HostGate`,
+shared with the site-wide crawler and re-exported here. Never retain the page
+HTML on an item: 5,000 x 90 KiB is 450 MB.
 """
 
 from __future__ import annotations
@@ -33,6 +34,12 @@ import httpx
 from services.crawler.http_client import MAX_HEAD_BYTES, MAX_HEAD_RETRY_BYTES, get_head_html
 from services.crawler.parser import first_text, link_by_rel, meta_by_name, meta_by_property, parse_html
 from services.crawler.robots import RobotsRules
+from services.crawler.throttle import (  # noqa: F401 - re-exported: callers and tests read them off this module
+    CRAWL_DELAY_CLAMP_S,
+    MAX_HOST_INTERVAL_S,
+    PER_HOST_MIN_INTERVAL_S,
+    HostGate,
+)
 from services.stores.models import CatalogItem, EnrichmentStats, HeadMeta
 
 logger = logging.getLogger("seo.stores.enrichment")
@@ -41,49 +48,9 @@ ENRICH_CONCURRENCY = 8
 #: After a 401/403/429 on products.json the same WAF is about to look at our
 #: page requests - halve the pressure.
 BLOCKED_HOST_CONCURRENCY = 4
-#: ~16 req/s ceiling. At the measured ~6 items/s this never binds normally; it is
-#: a safety rail, not a throttle.
-PER_HOST_MIN_INTERVAL_S = 0.06
-#: A hostile Crawl-delay cannot stall a job for hours.
-CRAWL_DELAY_CLAMP_S = 2.0
-MAX_HOST_INTERVAL_S = 2.0
 RETRY_DELAY_S = 0.5
 CONSECUTIVE_429_ABORT = 5
 CRAWL_DEADLINE_S = 20 * 60
-
-
-class HostGate:
-    """One per crawl (a crawl is one host). Serialises request STARTS so the rate
-    ceiling holds regardless of how many workers are in flight."""
-
-    def __init__(self, interval_s: float = PER_HOST_MIN_INTERVAL_S) -> None:
-        self.interval_s = max(interval_s, PER_HOST_MIN_INTERVAL_S)
-        self._lock = asyncio.Lock()
-        self._last_start = 0.0
-
-    @classmethod
-    def for_robots(cls, robots: RobotsRules) -> HostGate:
-        delay = robots.crawl_delay or 0.0
-        return cls(min(delay, CRAWL_DELAY_CLAMP_S))
-
-    async def wait(self) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            due = self._last_start + self.interval_s
-            if due > now:
-                await asyncio.sleep(due - now)
-                now = time.monotonic()
-            self._last_start = now
-
-    def back_off(self, retry_after: str | None = None) -> None:
-        """Quadruple the interval for the rest of the crawl, honouring Retry-After."""
-        proposed = self.interval_s * 4
-        try:
-            if retry_after:
-                proposed = max(proposed, float(retry_after))
-        except ValueError:
-            pass
-        self.interval_s = min(max(proposed, PER_HOST_MIN_INTERVAL_S), MAX_HOST_INTERVAL_S)
 
 
 def extract_head_meta(head_html: str) -> dict[str, str]:

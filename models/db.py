@@ -174,3 +174,119 @@ class StoreCrawl(Base):
     #: Phase 1 finished - the catalog is readable while phase 2 still runs.
     discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SiteCrawl(Base):
+    """One site-wide crawl of one host. The client polls this row for progress.
+
+    Sibling of StoreCrawl and deliberately a separate table, not a `kind` column
+    on it: a catalog crawl counts products and collections, a site crawl counts
+    pages and depth, and the two share almost no counter. Fusing them would mean
+    a row where half the columns are always null.
+
+    Job state lives in SQL for StoreCrawl's reason: Mongo writes are best-effort
+    here, and a crawl the client cannot poll is worse than one whose pages were
+    not kept. The pages themselves live in MongoDB (db/site_pages.py), keyed by
+    crawl id.
+
+    Every counter ships in v1 on purpose - see the same note on StoreCrawl:
+    `Integer, nullable=False, default=0` is a Python-side default that
+    db/session.py::_add_missing_columns cannot ALTER TABLE ADD later.
+    """
+
+    __tablename__ = "site_crawls"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    start_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    #: Lower-cased host of the seed, after normalisation. The crawl identity, and
+    #: what every same-site decision was made against.
+    host: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    site_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: Nullable and deliberately not a foreign key, as on Audit.user_id.
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    #: pending | crawling | complete | partial | failed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+
+    # --- the bounds this crawl actually ran under ---------------------------------
+    #: Stored, not just configured: the limits can be overridden per request, and a
+    #: report that says "we stopped at 500 pages" needs to know it was 500.
+    max_pages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # --- progress -----------------------------------------------------------------
+    pages_discovered: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pages_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pages_ok: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    client_errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    server_errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    transport_errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_by_robots: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_asset: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_non_html: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_off_site: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Inside the site but past max_depth. Tells the user which bound bound first.
+    beyond_depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    not_attempted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    seeded_from_sitemap: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_depth_seen: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # --- why it stopped -------------------------------------------------------------
+    hit_page_budget: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deadline_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    aborted_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # --- page-type filter ----------------------------------------------------------------
+    #: Comma-joined catalog page types this crawl was restricted to, e.g.
+    #: "product,collection". Null or empty means every page. Denormalised onto the
+    #: row (it also lives in `options`) because every report reads it.
+    page_types: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: Pages matching the filter - what the crawl was asked for.
+    target_pages: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    #: Pages fetched only to reach the targets. Shown so a filtered crawl can say
+    #: what it cost beyond the pages it returned.
+    navigation_pages: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    #: URLs refused outright for being outside the filter.
+    skipped_page_type: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+
+    # --- analysis ----------------------------------------------------------------------
+    #: Pages an analyzer scored, and the mean of their scores. A null avg_score
+    #: means page scoring was switched off, which is not "every page scored 0".
+    #:
+    #: These four are nullable where every counter above is NOT NULL, and that is
+    #: deliberate: they were added after `site_crawls` already existed in dev
+    #: databases, and db/session.py::_add_missing_columns can only ALTER TABLE ADD
+    #: a column that is nullable or carries a server_default. The class docstring
+    #: spells this out - read them as `row.x or 0`.
+    pages_analyzed: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    avg_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    critical_findings: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    warning_findings: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+
+    # --- headline findings -----------------------------------------------------------
+    #: Fetched pages that no other crawled page links to. The finding a site-wide
+    #: crawl exists to produce; a single-page audit cannot see it.
+    orphan_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    noindex_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    missing_title_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    missing_description_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Pages answering 4xx/5xx that something on the site links to - broken links.
+    broken_page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # --- persistence ------------------------------------------------------------------
+    #: Docs MongoDB accepted. 0 in a terminal status means Mongo was down: the
+    #: crawl ran, the pages were not kept. persistence_ok says so explicitly.
+    pages_persisted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    persistence_ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    #: The non-default CrawlLimits fields this crawl was asked for, e.g.
+    #: {"include_subdomains": true}. max_pages/max_depth have their own columns
+    #: because reports filter on them; the rest live here so the worker can
+    #: rebuild the exact limits without a column per knob.
+    options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    #: Free-text notes from CrawlStats, e.g. "sitemap seeding stopped at 1000 URLs".
+    notes: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    elapsed_s: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

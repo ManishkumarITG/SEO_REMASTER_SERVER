@@ -479,7 +479,8 @@ async def crawl_site(
             stats.not_attempted += 1
             return
         if is_target:
-            if reserved >= limits.max_pages:
+            budget = limits.page_budget
+            if budget is not None and reserved >= budget:
                 # Reserved BEFORE the await, so `max_pages` is a real ceiling rather
                 # than a number `concurrency` workers can each overshoot.
                 stopping = True

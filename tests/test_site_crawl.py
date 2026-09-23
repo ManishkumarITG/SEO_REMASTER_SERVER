@@ -514,8 +514,10 @@ def test_from_settings_falls_back_to_defaults_for_an_object_with_no_site_crawl_k
 
 
 def test_nonsense_bounds_are_clamped_rather_than_trusted() -> None:
-    limits = CrawlLimits(max_pages=0, max_depth=-3, concurrency=0)
-    assert (limits.max_pages, limits.max_depth, limits.concurrency) == (1, 0, 1)
+    """0 pages is the "all pages" option now, so only the others are floored."""
+    limits = CrawlLimits(max_pages=-3, max_depth=-3, concurrency=0)
+    assert (limits.max_pages, limits.max_depth, limits.concurrency) == (0, 0, 1)
+    assert CrawlLimits(max_pages=0).page_budget is None
 
 
 # --- page-type filter ---------------------------------------------------------------------
@@ -705,3 +707,40 @@ async def test_skipped_and_asset_records_are_classified_without_a_filter() -> No
     page = by_url(await crawl())[f"{ORIGIN}/logo.png"]
     assert page.skipped == "asset"
     assert page.is_target is True  # no filter means everything was asked for
+
+
+# --- no page limit -------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_max_pages_zero_crawls_every_page_it_can_reach() -> None:
+    """0 is the "all pages" option: the deadline and the depth are the bounds."""
+    mock_site({
+        "/": page_html(links=tuple(f"/p{i}" for i in range(12))),
+        **{f"/p{i}": page_html() for i in range(12)},
+    })
+    result = await crawl(max_pages=0)
+    assert result.stats.fetched == 13  # the seed plus every link
+    assert result.stats.hit_page_budget is False
+    assert result.stats.aborted_reason == ""
+
+
+@respx.mock
+async def test_without_a_page_limit_the_depth_limit_still_binds() -> None:
+    mock_site({"/": page_html(links=("/a",)), "/a": page_html(links=("/b",)), "/b": page_html()})
+    result = await crawl(max_pages=0, max_depth=1)
+    assert result.stats.fetched == 2
+    assert result.stats.beyond_depth == 1
+
+
+@respx.mock
+async def test_without_a_page_limit_the_deadline_still_binds() -> None:
+    mock_site({"/": page_html()})
+    result = await crawl(max_pages=0, deadline_s=0.0)
+    assert result.stats.fetched == 0
+    assert result.stats.deadline_hit is True
+
+
+def test_page_budget_reads_zero_as_no_limit() -> None:
+    assert CrawlLimits(max_pages=0).page_budget is None
+    assert CrawlLimits(max_pages=250).page_budget == 250

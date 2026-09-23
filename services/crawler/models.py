@@ -136,6 +136,11 @@ class CrawlLimits:
 
     #: Pages FETCHED, not URLs discovered. Reaching it is a normal outcome
     #: (`stats.hit_page_budget`), not an error.
+    #:
+    #: ZERO MEANS NO PAGE LIMIT. The crawl is then bounded by `deadline_s` and
+    #: `max_depth` instead, which are real bounds and not advisory: at the default
+    #: pacing an unlimited crawl still cannot outlive its deadline. Zero is the
+    #: only special value; every other number is a literal ceiling.
     max_pages: int = 500
     #: Link distance from the seed. 0 crawls the seed alone.
     max_depth: int = 5
@@ -170,11 +175,18 @@ class CrawlLimits:
     max_navigation_pages: int = 100
 
     def __post_init__(self) -> None:
-        self.max_pages = max(1, int(self.max_pages))
+        # 0 survives as "no limit"; anything else is floored at 1 so a negative
+        # cannot quietly become unlimited.
+        self.max_pages = max(0, int(self.max_pages))
         self.max_depth = max(0, int(self.max_depth))
         self.concurrency = max(1, int(self.concurrency))
         self.max_navigation_pages = max(0, int(self.max_navigation_pages))
         self.page_types = tuple(dict.fromkeys(self.page_types))  # dedupe, keep order
+
+    @property
+    def page_budget(self) -> int | None:
+        """The page ceiling, or None when the crawl was asked for every page."""
+        return self.max_pages or None
 
     def wants(self, page_type: str | None) -> bool:
         """True when a page of this type is part of the answer.

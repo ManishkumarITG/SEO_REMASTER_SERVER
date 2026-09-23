@@ -68,13 +68,16 @@ def _progress_pct(row: SiteCrawl) -> int:
     A crawl discovers its own work: until it ends, nobody knows how many pages
     the site has. Showing "47 of 500 allowed" is honest; showing "47 of 47 found
     so far" would sit at 100% from the first page.
+
+    A crawl with NO page limit has no denominator, so this stays 0 until it ends
+    and the client shows an indeterminate bar. Inventing a percentage there would
+    be a number with nothing behind it.
     """
     if row.status in _TERMINAL:
         return 100
-    if row.status == "pending":
+    if row.status == "pending" or row.max_pages <= 0:
         return 0
-    budget = max(row.max_pages, 1)
-    return min(99, max(1, int(100 * row.pages_fetched / budget)))
+    return min(99, max(1, int(100 * row.pages_fetched / row.max_pages)))
 
 
 def _status_response(row: SiteCrawl) -> SiteCrawlStatusResponse:

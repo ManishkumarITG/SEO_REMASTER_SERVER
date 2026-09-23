@@ -39,8 +39,10 @@ MAX_REQUESTABLE_DEPTH = 10
 
 class SiteCrawlCreateRequest(BaseModel):
     start_url: str = Field(min_length=1, max_length=2048, description="Any page on the site")
-    #: None means "use the configured default" - not "unlimited".
-    max_pages: int | None = Field(default=None, ge=1, le=MAX_REQUESTABLE_PAGES)
+    #: None means "use the configured default". ZERO means no page limit at all,
+    #: in which case the time limit and the depth limit are the only bounds left -
+    #: which is why they are not optional and cannot be switched off from here.
+    max_pages: int | None = Field(default=None, ge=0, le=MAX_REQUESTABLE_PAGES)
     max_depth: int | None = Field(default=None, ge=0, le=MAX_REQUESTABLE_DEPTH)
     include_subdomains: bool | None = None
     #: Following rel="nofollow" ignores an explicit instruction from the site, so

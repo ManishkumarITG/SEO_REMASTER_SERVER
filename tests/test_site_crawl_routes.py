@@ -9,6 +9,7 @@ reads are stubbed on `db.site_pages`.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -39,7 +40,7 @@ def _host() -> str:
 def _stubs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     scheduled: list[str] = []
 
-    async def fake_run(crawl_id: str) -> None:
+    def fake_schedule(crawl_id: str) -> None:
         scheduled.append(crawl_id)
 
     async def fake_probe(client, url):
@@ -47,7 +48,7 @@ def _stubs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         return SiteProbe(start_url=url, origin=f"https://{host}", host=host,
                          robots=RobotsRules.permissive(), site_name="Example Site")
 
-    monkeypatch.setattr(service, "run_site_crawl", fake_run)
+    monkeypatch.setattr(service, "schedule_site_crawl", fake_schedule)
     monkeypatch.setattr(service, "probe_site", fake_probe)
     monkeypatch.setattr(service, "crawl_client", _fake_client)
     return scheduled
@@ -319,3 +320,69 @@ async def test_pages_can_be_filtered_to_one_catalog_type(monkeypatch: pytest.Mon
     monkeypatch.setattr(site_pages, "load_pages", load_pages)
     body = _client().get(f"/api/site-crawls/{row.id}/pages", params={"issue": "product"}).json()
     assert body["pages"][0]["page_type"] == "product"
+
+
+# --- abandoned crawls ---------------------------------------------------------------------
+
+
+async def test_a_crawl_whose_worker_died_is_closed_out_when_polled() -> None:
+    """Otherwise the row says "crawling" forever and the client polls a corpse."""
+    from workers.tasks import SITE_CRAWL_STALE_AFTER_S
+
+    row = await _seed_row(
+        status="crawling",
+        max_pages=50,
+        pages_fetched=62,
+        heartbeat_at=datetime.now(UTC) - timedelta(seconds=SITE_CRAWL_STALE_AFTER_S + 60),
+    )
+    body = _client().get(f"/api/site-crawls/{row.id}").json()
+    assert body["status"] == "failed"
+    assert "server restarted" in (body["error"] or "")
+    assert body["pages_fetched"] == 62  # what it found is still reported
+
+
+async def test_a_crawl_with_a_fresh_heartbeat_is_left_running() -> None:
+    row = await _seed_row(status="crawling", heartbeat_at=datetime.now(UTC))
+    body = _client().get(f"/api/site-crawls/{row.id}").json()
+    assert body["status"] == "crawling"
+    assert body["error"] is None
+
+
+async def test_a_crawl_running_in_this_process_is_never_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with an old heartbeat, a task we are holding is alive by definition."""
+    from workers.tasks import SITE_CRAWL_STALE_AFTER_S
+
+    row = await _seed_row(
+        status="crawling",
+        heartbeat_at=datetime.now(UTC) - timedelta(seconds=SITE_CRAWL_STALE_AFTER_S + 60),
+    )
+    monkeypatch.setattr(service, "site_crawl_is_running", lambda crawl_id: True)
+    body = _client().get(f"/api/site-crawls/{row.id}").json()
+    assert body["status"] == "crawling"
+
+
+# --- stopping -----------------------------------------------------------------------------
+
+
+async def test_stopping_a_running_crawl_signals_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = await _seed_row(status="crawling", heartbeat_at=datetime.now(UTC))
+    asked: list[str] = []
+    monkeypatch.setattr(service, "request_site_crawl_stop", lambda cid: asked.append(cid) or True)
+    response = _client().post(f"/api/site-crawls/{row.id}/stop")
+    assert response.status_code == 200
+    assert asked == [row.id]
+    # Still "crawling": the stop is cooperative and the client polls until it lands.
+    assert response.json()["status"] == "crawling"
+
+
+async def test_stopping_a_finished_crawl_is_not_an_error() -> None:
+    row = await _seed_row(status="complete", pages_fetched=10)
+    response = _client().post(f"/api/site-crawls/{row.id}/stop")
+    assert response.status_code == 200
+    assert response.json()["status"] == "complete"
+
+
+def test_stopping_an_unknown_crawl_is_404() -> None:
+    assert _client().post(f"/api/site-crawls/{uuid4()}/stop").status_code == 404

@@ -247,6 +247,10 @@ class SiteCrawl(Base):
     navigation_pages: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     #: URLs refused outright for being outside the filter.
     skipped_page_type: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    #: Rate-limit responses received, and pages given up to them. Nullable for the
+    #: same reason as the counters above: added after the table existed.
+    throttled: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    gave_up_throttled: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
 
     # --- analysis ----------------------------------------------------------------------
     #: Pages an analyzer scored, and the mean of their scores. A null avg_score
@@ -289,4 +293,13 @@ class SiteCrawl(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: Last sign of life from the worker, refreshed on every progress flush.
+    #:
+    #: Startup reconciliation used to fail EVERY non-terminal row, on the
+    #: assumption that a fresh process means the old one died. That is wrong the
+    #: moment two processes share this database: a second server starting - even
+    #: one that then fails to bind its port - killed crawls that were running
+    #: perfectly well in the first. Reconciliation now only claims rows whose
+    #: heartbeat has gone quiet.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

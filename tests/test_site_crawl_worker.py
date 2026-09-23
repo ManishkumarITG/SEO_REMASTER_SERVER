@@ -8,7 +8,9 @@ SQLite with fresh ids per test.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -64,7 +66,7 @@ def _install_crawl(monkeypatch: pytest.MonkeyPatch, pages: list[CrawledPage], **
     seen_hooks.clear()
 
     async def fake_crawl_site(client, start_url, *, robots=None, limits=None, gate=None,
-                              stats=None, extra_seeds=(), page_hook=None):
+                              stats=None, extra_seeds=(), page_hook=None, should_stop=None):
         seen_hooks.append(page_hook)
         for page in pages:
             yield page
@@ -294,12 +296,42 @@ async def test_mongo_being_down_does_not_fail_the_crawl(monkeypatch: pytest.Monk
 
 
 async def test_reconcile_fails_crawls_left_running_by_a_dead_process() -> None:
-    stuck = await _new_crawl(status="crawling")
+    stuck = await _new_crawl(status="crawling")  # no heartbeat at all
     done = await _new_crawl(status="complete")
     await tasks.reconcile_orphaned_site_crawls()
     assert (await _row(stuck)).status == "failed"
     assert "restarted" in ((await _row(stuck)).error_message or "")
     assert (await _row(done)).status == "complete"  # terminal rows are untouched
+
+
+async def test_reconcile_leaves_a_crawl_that_is_still_alive_alone() -> None:
+    """The regression that killed a live crawl: a second process starting up.
+
+    Reconciliation used to fail every non-terminal row, so merely launching
+    another server - even one that died on a port clash a second later - marked a
+    healthy running crawl as failed.
+    """
+    alive = await _new_crawl(status="crawling", heartbeat_at=datetime.now(UTC))
+    await tasks.reconcile_orphaned_site_crawls()
+    row = await _row(alive)
+    assert row.status == "crawling"
+    assert row.error_message is None
+
+
+async def test_reconcile_claims_a_crawl_whose_heartbeat_went_quiet() -> None:
+    stale = await _new_crawl(
+        status="crawling",
+        heartbeat_at=datetime.now(UTC) - timedelta(seconds=tasks.SITE_CRAWL_STALE_AFTER_S + 60),
+    )
+    await tasks.reconcile_orphaned_site_crawls()
+    assert (await _row(stale)).status == "failed"
+
+
+async def test_a_running_crawl_records_a_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawl_id = await _new_crawl()
+    _install_crawl(monkeypatch, [_page(f"{ORIGIN}/", title="Home")])
+    await tasks.run_site_crawl(crawl_id)
+    assert (await _row(crawl_id)).heartbeat_at is not None
 
 
 def test_site_page_record_carries_the_crawl_identity() -> None:
@@ -339,3 +371,81 @@ async def test_analysis_totals_reach_the_row(monkeypatch: pytest.MonkeyPatch) ->
     assert row.pages_analyzed == 3
     assert row.avg_score == 80.0  # 240 / 3, computed once at the end
     assert row.critical_findings == 2 and row.warning_findings == 5
+
+
+# --- scheduling and stopping -----------------------------------------------------------------
+
+
+async def test_a_scheduled_crawl_runs_detached_from_whoever_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point: the crawl must not be tied to the request that started it."""
+    crawl_id = await _new_crawl()
+    _install_crawl(monkeypatch, [_page(f"{ORIGIN}/", title="Home")])
+
+    tasks.schedule_site_crawl(crawl_id)
+    assert tasks.site_crawl_is_running(crawl_id)
+    await tasks.wait_for_site_crawl(crawl_id)
+
+    assert (await _row(crawl_id)).status == "complete"
+    assert not tasks.site_crawl_is_running(crawl_id)  # the registry cleans itself up
+
+
+async def test_scheduling_the_same_crawl_twice_starts_one_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crawl_id = await _new_crawl()
+    started: list[str] = []
+
+    async def counting_run(cid: str) -> None:
+        started.append(cid)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(tasks, "run_site_crawl", counting_run)
+    tasks.schedule_site_crawl(crawl_id)
+    tasks.schedule_site_crawl(crawl_id)
+    await tasks.wait_for_site_crawl(crawl_id)
+    assert started == [crawl_id]
+
+
+async def test_stopping_a_crawl_keeps_what_it_already_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop is cooperative: cancelling the task would lose the fetched pages."""
+    crawl_id = await _new_crawl()
+    saved: list[dict] = []
+
+    async def save_pages(records):
+        saved.extend(records)
+        return len(records)
+
+    async def slow_crawl(client, start_url, *, robots=None, limits=None, gate=None,
+                         stats=None, extra_seeds=(), page_hook=None, should_stop=None):
+        for i in range(10):
+            if should_stop is not None and should_stop():
+                if stats is not None:
+                    stats.stopped_by_user = True
+                    stats.aborted_reason = "stopped by user"
+                break
+            yield _page(f"{ORIGIN}/p{i}", title=f"P{i}")
+            if i == 2:
+                tasks.request_site_crawl_stop(crawl_id)
+            await asyncio.sleep(0)
+        if stats is not None:
+            stats.fetched = len(saved) or 3
+            stats.ok = stats.fetched
+
+    monkeypatch.setattr(tasks, "save_pages", save_pages)
+    monkeypatch.setattr(tasks, "crawl_site", slow_crawl)
+
+    tasks.schedule_site_crawl(crawl_id)
+    await tasks.wait_for_site_crawl(crawl_id)
+
+    row = await _row(crawl_id)
+    assert row.status == "stopped"
+    assert row.aborted_reason == "stopped by user"
+    assert len(saved) >= 3  # the pages fetched before the stop were kept
+
+
+def test_stopping_a_crawl_that_is_not_running_says_so() -> None:
+    assert tasks.request_site_crawl_stop("no-such-crawl") is False

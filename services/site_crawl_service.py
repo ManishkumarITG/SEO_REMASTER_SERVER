@@ -19,6 +19,7 @@ catalog crawls are.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import BackgroundTasks, HTTPException
@@ -47,11 +48,16 @@ from services.crawler.models import CrawlLimits
 from services.crawler.site_crawl import probe_site
 from services.crawler.urls import host_of
 from services.reports.scoring import grade_for
-from workers.tasks import run_site_crawl
+from workers.tasks import (
+    SITE_CRAWL_STALE_AFTER_S,
+    request_site_crawl_stop,
+    schedule_site_crawl,
+    site_crawl_is_running,
+)
 
 logger = logging.getLogger("seo.site_crawl")
 
-_TERMINAL = ("complete", "partial", "failed")
+_TERMINAL = ("complete", "partial", "failed", "stopped")
 #: Cap on the orphan list in the issues response. The COUNT is always exact; a
 #: site with 4,000 orphans has one problem, not 4,000, and the paged
 #: `?issue=orphan` endpoint is there for the full list.
@@ -118,6 +124,8 @@ def _status_response(row: SiteCrawl) -> SiteCrawlStatusResponse:
         target_pages=row.target_pages or 0,
         navigation_pages=row.navigation_pages or 0,
         skipped_page_type=row.skipped_page_type or 0,
+        throttled=row.throttled or 0,
+        gave_up_throttled=row.gave_up_throttled or 0,
         pages_analyzed=row.pages_analyzed or 0,
         avg_score=row.avg_score,
         grade=grade_for(row.avg_score) if row.avg_score is not None else None,
@@ -182,6 +190,43 @@ async def _require_crawl(crawl_id: str, session: AsyncSession) -> SiteCrawl:
     row = await session.get(SiteCrawl, crawl_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"Site crawl {crawl_id} not found")
+    return await _reap_if_abandoned(row, session)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """SQLite hands back naive datetimes even for timezone-aware columns."""
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+async def _reap_if_abandoned(row: SiteCrawl, session: AsyncSession) -> SiteCrawl:
+    """Close out a row whose worker died without it.
+
+    Startup reconciliation alone is not enough. It only runs when a process
+    starts, so a crawl killed mid-run - by a restart, or by `uvicorn --reload`
+    noticing a saved file - leaves a row that says "crawling" and never changes
+    again, and the client polls it forever. Checking on read is the one moment
+    somebody actually cares about the answer.
+
+    The heartbeat is what makes this safe: a crawl running in ANOTHER process is
+    still writing one, so it is never reaped by this one.
+    """
+    if row.status in _TERMINAL or site_crawl_is_running(row.id):
+        return row
+    last_seen = _as_utc(row.heartbeat_at) or _as_utc(row.started_at) or _as_utc(row.created_at)
+    if last_seen is None:
+        return row
+    if datetime.now(UTC) - last_seen < timedelta(seconds=SITE_CRAWL_STALE_AFTER_S):
+        return row
+    logger.info("Site crawl %s has been silent since %s - marking it interrupted", row.id, last_seen)
+    row.status = "failed"
+    row.error_message = (
+        "The crawl stopped because the server restarted. Everything it had already "
+        "found is kept. If the server is running with --reload, saving a file restarts it."
+    )
+    row.completed_at = datetime.now(UTC)
+    await session.commit()
     return row
 
 
@@ -193,7 +238,7 @@ async def create_site_crawl(
     background_tasks: BackgroundTasks,
     session: AsyncSession,
     user_id: str | None,
-) -> SiteCrawlCreatedResponse:
+  ) -> SiteCrawlCreatedResponse:
     start_url = payload.start_url
     host = host_of(start_url)
     if not host:
@@ -243,7 +288,9 @@ async def create_site_crawl(
     )
     session.add(row)
     await session.commit()
-    background_tasks.add_task(run_site_crawl, row.id)
+    # NOT a FastAPI BackgroundTask: those run inside the response and die with
+    # the client connection, which is how a long crawl used to be cut short.
+    schedule_site_crawl(row.id)
     return SiteCrawlCreatedResponse(
         crawl_id=row.id, start_url=row.start_url, host=row.host, status="pending"
     )
@@ -251,6 +298,28 @@ async def create_site_crawl(
 
 async def get_site_crawl(crawl_id: str, session: AsyncSession) -> SiteCrawlStatusResponse:
     return _status_response(await _require_crawl(crawl_id, session))
+
+
+async def stop_site_crawl(crawl_id: str, session: AsyncSession) -> SiteCrawlStatusResponse:
+    """Ask a running crawl to finish now, keeping everything it has already found.
+
+    404 for an unknown id. A crawl that has already finished is NOT an error: the
+    caller wanted it stopped and it is stopped, so the current row is returned.
+    The stop itself is cooperative, so this returns while the crawl is still
+    winding down and the client keeps polling until the status turns terminal.
+    """
+    row = await _require_crawl(crawl_id, session)
+    if row.status in _TERMINAL:
+        return _status_response(row)
+    if not request_site_crawl_stop(crawl_id):
+        # Running in a previous process, or already finishing. Nothing left to
+        # signal, and startup reconciliation will close out a truly orphaned row.
+        logger.info("Stop requested for site crawl %s, which is not running here", crawl_id)
+    return _status_response(row)
+
+
+def is_running(crawl_id: str) -> bool:
+    return site_crawl_is_running(crawl_id)
 
 
 async def list_site_crawls(

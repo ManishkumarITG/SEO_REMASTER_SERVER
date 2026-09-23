@@ -26,21 +26,39 @@ from services.crawler.robots import RobotsRules
 PER_HOST_MIN_INTERVAL_S = 0.06
 #: A hostile `Crawl-delay: 600` cannot stall a job for hours.
 CRAWL_DELAY_CLAMP_S = 2.0
-#: Ceiling after back-off, so a host answering 429 forever cannot park a worker.
+#: Default ceiling after back-off. Low enough that a head-only catalog pass keeps
+#: moving; a caller that would rather wait than give up raises it per gate.
 MAX_HOST_INTERVAL_S = 2.0
+#: How fast the interval decays back toward the floor once a host stops
+#: complaining. Backing off has to be reversible, or one 429 early in a long
+#: crawl slows every remaining page for no reason.
+RECOVERY_FACTOR = 0.8
 
 
 class HostGate:
     """One per crawl (a crawl is one host). Serialises request STARTS so the rate
     ceiling holds regardless of how many workers are in flight."""
 
-    def __init__(self, interval_s: float = PER_HOST_MIN_INTERVAL_S) -> None:
-        self.interval_s = max(interval_s, PER_HOST_MIN_INTERVAL_S)
+    def __init__(
+        self,
+        interval_s: float = PER_HOST_MIN_INTERVAL_S,
+        *,
+        max_interval_s: float = MAX_HOST_INTERVAL_S,
+    ) -> None:
+        self.floor_s = max(interval_s, PER_HOST_MIN_INTERVAL_S)
+        self.interval_s = self.floor_s
+        self.max_interval_s = max(max_interval_s, self.floor_s)
         self._lock = asyncio.Lock()
         self._last_start = 0.0
 
     @classmethod
-    def for_robots(cls, robots: RobotsRules, *, floor_s: float = PER_HOST_MIN_INTERVAL_S) -> HostGate:
+    def for_robots(
+        cls,
+        robots: RobotsRules,
+        *,
+        floor_s: float = PER_HOST_MIN_INTERVAL_S,
+        max_interval_s: float = MAX_HOST_INTERVAL_S,
+    ) -> HostGate:
         """Honour Crawl-delay (clamped), never going below `floor_s`.
 
         `floor_s` is how a caller asks to be gentler than the global floor: a
@@ -49,7 +67,7 @@ class HostGate:
         behaviour exactly.
         """
         delay = robots.crawl_delay or 0.0
-        return cls(max(min(delay, CRAWL_DELAY_CLAMP_S), floor_s))
+        return cls(max(min(delay, CRAWL_DELAY_CLAMP_S), floor_s), max_interval_s=max_interval_s)
 
     async def wait(self) -> None:
         async with self._lock:
@@ -61,11 +79,20 @@ class HostGate:
             self._last_start = now
 
     def back_off(self, retry_after: str | None = None) -> None:
-        """Quadruple the interval for the rest of the crawl, honouring Retry-After."""
+        """Quadruple the interval, honouring Retry-After, up to this gate ceiling."""
         proposed = self.interval_s * 4
         try:
             if retry_after:
                 proposed = max(proposed, float(retry_after))
         except ValueError:
             pass
-        self.interval_s = min(max(proposed, PER_HOST_MIN_INTERVAL_S), MAX_HOST_INTERVAL_S)
+        self.interval_s = min(max(proposed, self.floor_s), self.max_interval_s)
+
+    def recover(self) -> None:
+        """Ease back toward the floor after a request the host was happy with.
+
+        Without this, a single 429 in the first minute of a long crawl keeps every
+        later request slow, and the crawl runs out of time having learned nothing.
+        """
+        if self.interval_s > self.floor_s:
+            self.interval_s = max(self.floor_s, self.interval_s * RECOVERY_FACTOR)

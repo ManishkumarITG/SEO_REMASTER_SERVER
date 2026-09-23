@@ -59,6 +59,19 @@ async def get_site_crawl(
     return await site_crawl_controller.get_site_crawl(crawl_id, session)
 
 
+@router.post("/{crawl_id}/stop", response_model=SiteCrawlStatusResponse)
+async def stop_site_crawl(
+    crawl_id: str, session: AsyncSession = Depends(get_session)
+) -> SiteCrawlStatusResponse:
+    """Stop a running crawl, keeping every page it has already found.
+
+    The only thing that interrupts a crawl on purpose. Everything else - rate
+    limiting, a slow host, a page that will not load - is handled by waiting or
+    by skipping one page, never by giving up.
+    """
+    return await site_crawl_controller.stop_site_crawl(crawl_id, session)
+
+
 @router.get("/{crawl_id}/pages", response_model=SiteCrawlPagesResponse)
 async def get_site_crawl_pages(
     crawl_id: str,

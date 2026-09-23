@@ -13,8 +13,9 @@ from services.crawler.models import CrawlLimits, SiteCrawlResult
 from services.crawler.parser import parse_html
 from services.crawler.robots import RobotsRules
 from services.crawler.site_crawl import (
-    CONSECUTIVE_429_ABORT,
+    MAX_THROTTLE_RETRIES,
     collect_site_crawl,
+    crawl_site,
     extract_page_facts,
     robots_target,
 )
@@ -75,11 +76,20 @@ def mock_site(pages: dict[str, str]) -> None:
         respx.get(f"{ORIGIN}{path}").mock(return_value=html_response(body))
 
 
-async def crawl(*, start: str = f"{ORIGIN}/", robots: object = _DEFAULT, **limit_kw: object) -> SiteCrawlResult:
+async def crawl(
+    *,
+    start: str = f"{ORIGIN}/",
+    robots: object = _DEFAULT,
+    should_stop: object = None,
+    **limit_kw: object,
+) -> SiteCrawlResult:
     rules = RobotsRules.permissive() if robots is _DEFAULT else robots
     limits = CrawlLimits(seed_from_sitemap=False, **limit_kw)  # type: ignore[arg-type]
     async with crawl_client() as client:
-        return await collect_site_crawl(client, start, robots=rules, limits=limits)  # type: ignore[arg-type]
+        return await collect_site_crawl(
+            client, start, robots=rules, limits=limits,  # type: ignore[arg-type]
+            should_stop=should_stop,  # type: ignore[arg-type]
+        )
 
 
 def by_url(result: SiteCrawlResult) -> dict[str, object]:
@@ -326,13 +336,48 @@ async def test_status_codes_are_bucketed_for_the_report() -> None:
 
 
 @respx.mock
-async def test_repeated_429s_abort_the_crawl() -> None:
-    limit = CONSECUTIVE_429_ABORT
-    mock_site({"/": page_html(links=tuple(f"/p{i}" for i in range(limit)))})
-    for i in range(limit):
-        respx.get(f"{ORIGIN}/p{i}").mock(return_value=httpx.Response(429, text="slow down"))
-    result = await crawl(concurrency=limit)
-    assert result.stats.aborted_reason == f"{limit} consecutive 429s"
+async def test_a_throttled_page_is_retried_and_then_succeeds() -> None:
+    """429 means slow down, not go away, so the page is asked for again."""
+    respx.get(f"{ORIGIN}/").mock(return_value=html_response(page_html(links=("/a",))))
+    route = respx.get(f"{ORIGIN}/a").mock(
+        side_effect=[
+            httpx.Response(429, text="slow down"),
+            html_response(page_html(title="Got there")),
+        ]
+    )
+    result = await crawl(min_interval_s=0.0)
+    page = by_url(result)[f"{ORIGIN}/a"]
+    assert page.ok and page.title == "Got there"
+    assert route.call_count == 2
+    assert result.stats.throttled == 1
+    assert result.stats.gave_up_throttled == 0
+
+
+@respx.mock
+async def test_a_host_that_throttles_forever_costs_one_page_not_the_crawl() -> None:
+    """The regression that started this: a rate-limited store killed the whole run."""
+    mock_site({
+        "/": page_html(links=("/blocked", "/fine")),
+        "/fine": page_html(title="Fine"),
+    })
+    respx.get(f"{ORIGIN}/blocked").mock(return_value=httpx.Response(429, text="slow down"))
+    result = await crawl(min_interval_s=0.0)
+    assert by_url(result)[f"{ORIGIN}/fine"].ok  # the rest of the crawl still ran
+    assert result.stats.gave_up_throttled == 1
+    assert result.stats.aborted_reason == ""  # nothing was aborted
+    assert result.stats.throttled == MAX_THROTTLE_RETRIES
+
+
+@respx.mock
+async def test_a_503_is_treated_as_throttling_rather_than_a_server_error() -> None:
+    respx.get(f"{ORIGIN}/").mock(return_value=html_response(page_html(links=("/a",))))
+    route = respx.get(f"{ORIGIN}/a").mock(
+        side_effect=[httpx.Response(503), html_response(page_html(title="Back up"))]
+    )
+    result = await crawl(min_interval_s=0.0)
+    assert by_url(result)[f"{ORIGIN}/a"].title == "Back up"
+    assert route.call_count == 2
+    assert result.stats.throttled == 1
 
 
 @respx.mock
@@ -744,3 +789,108 @@ async def test_without_a_page_limit_the_deadline_still_binds() -> None:
 def test_page_budget_reads_zero_as_no_limit() -> None:
     assert CrawlLimits(max_pages=0).page_budget is None
     assert CrawlLimits(max_pages=250).page_budget == 250
+
+
+# --- back-off behaviour --------------------------------------------------------------------
+
+
+def test_the_gate_ceiling_is_per_gate_so_a_site_crawl_can_wait_longer() -> None:
+    from services.crawler.site_crawl import THROTTLED_MAX_INTERVAL_S
+    from services.crawler.throttle import MAX_HOST_INTERVAL_S, HostGate
+
+    catalog = HostGate(0.06)
+    site = HostGate(0.1, max_interval_s=THROTTLED_MAX_INTERVAL_S)
+    for _ in range(12):
+        catalog.back_off()
+        site.back_off()
+    assert catalog.interval_s == MAX_HOST_INTERVAL_S  # unchanged for the catalog crawl
+    assert site.interval_s == THROTTLED_MAX_INTERVAL_S
+    assert site.interval_s > catalog.interval_s
+
+
+def test_backing_off_is_reversible() -> None:
+    """One 429 early on must not slow every remaining page of a long crawl."""
+    from services.crawler.throttle import HostGate
+
+    gate = HostGate(0.1, max_interval_s=30.0)
+    gate.back_off()
+    raised = gate.interval_s
+    assert raised > 0.1
+    for _ in range(50):
+        gate.recover()
+    assert gate.interval_s == 0.1  # all the way back to the floor, never below
+
+
+def test_retry_after_is_honoured_up_to_a_ceiling() -> None:
+    from services.crawler.site_crawl import _retry_after_seconds
+
+    assert _retry_after_seconds("30") == 30.0
+    assert _retry_after_seconds(None) is None
+    # A date-formatted Retry-After is ignored rather than guessed at.
+    assert _retry_after_seconds("Wed, 21 Oct 2026 07:28:00 GMT") is None
+
+
+@respx.mock
+async def test_an_unlimited_crawl_seeds_the_whole_sitemap() -> None:
+    """With no page budget the seed cap used to collapse to 100 URLs."""
+    from services.crawler.site_crawl import MAX_SITEMAP_SEEDS
+
+    locs = "".join(f"<url><loc>{ORIGIN}/p{i}</loc></url>" for i in range(150))
+    respx.get(f"{ORIGIN}/sitemap.xml").mock(return_value=httpx.Response(
+        200, text=f'<?xml version="1.0"?><urlset>{locs}</urlset>',
+        headers={"content-type": "application/xml"},
+    ))
+    respx.get(url__regex=rf"{ORIGIN}/p\d+").mock(return_value=html_response(page_html()))
+    mock_site({"/": page_html()})
+
+    limits = CrawlLimits(seed_from_sitemap=True, max_pages=0, max_depth=0, min_interval_s=0.0)
+    async with crawl_client() as client:
+        result = await collect_site_crawl(
+            client, f"{ORIGIN}/", robots=RobotsRules.permissive(), limits=limits
+        )
+    assert MAX_SITEMAP_SEEDS >= 25_000
+    assert result.stats.seeded_from_sitemap == 150  # not capped at 100
+    assert not any("sitemap seeding stopped" in note for note in result.stats.notes)
+
+
+# --- explicit stop -------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_a_stop_signal_ends_the_crawl_and_keeps_what_it_found() -> None:
+    """Stop is the one interruption on purpose, and it is not a failure."""
+    mock_site({
+        "/": page_html(links=tuple(f"/p{i}" for i in range(8))),
+        **{f"/p{i}": page_html() for i in range(8)},
+    })
+    fetched: list[str] = []
+    stop = False
+
+    def should_stop() -> bool:
+        return stop
+
+    limits = CrawlLimits(seed_from_sitemap=False, min_interval_s=0.0, concurrency=1)
+    async with crawl_client() as client:
+        async for page in crawl_site(
+            client, f"{ORIGIN}/", robots=RobotsRules.permissive(),
+            limits=limits, should_stop=should_stop,
+        ):
+            if page.fetched:
+                fetched.append(page.url)
+            if len(fetched) == 3:
+                stop = True
+
+    # Cooperative, so a page already in flight still finishes: the guarantee is
+    # that it stops promptly and keeps everything it found, not that it stops on
+    # an exact count. 9 pages were reachable.
+    assert 3 <= len(fetched) <= 5
+    assert f"{ORIGIN}/" in fetched
+
+
+@respx.mock
+async def test_a_crawl_stopped_before_it_starts_fetches_nothing() -> None:
+    mock_site({"/": page_html()})
+    result = await crawl(should_stop=lambda: True)
+    assert result.stats.fetched == 0
+    assert result.stats.stopped_by_user is True
+    assert result.stats.aborted_reason == "stopped by user"

@@ -13,10 +13,10 @@ import asyncio
 import logging
 import time
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 
 from config import get_settings
 from db.session import async_session_factory
@@ -535,6 +535,69 @@ SITE_FLUSH_EVERY_PAGES = 25
 SITE_FLUSH_EVERY_SECONDS = 2.0
 
 _NON_TERMINAL_SITE_CRAWL = ("pending", "crawling")
+#: A crawl silent for longer than this is presumed dead. Comfortably longer
+#: than SITE_FLUSH_EVERY_SECONDS, and longer than the worst single pause a
+#: throttled crawl takes between requests, so a slow crawl is never mistaken
+#: for an abandoned one.
+SITE_CRAWL_STALE_AFTER_S = 180
+
+#: Crawls running right now, and the ids someone has asked to stop.
+#:
+#: The tasks are held here for two reasons. One is correctness: asyncio keeps
+#: only a weak reference to a bare `create_task`, so a crawl can be garbage
+#: collected mid-run. The other is the point of this registry - a crawl must
+#: outlive the HTTP request that started it. FastAPI BackgroundTasks run inside
+#: the response, so they are cancelled when the client goes away, which is not a
+#: reason to abandon a ten-minute crawl.
+_running_site_crawls: dict[str, asyncio.Task[None]] = {}
+_stop_requested: set[str] = set()
+
+
+def schedule_site_crawl(crawl_id: str) -> None:
+    """Start a crawl on the event loop, detached from the request that asked for it."""
+    if crawl_id in _running_site_crawls:
+        return
+    task = asyncio.create_task(run_site_crawl(crawl_id), name=f"site-crawl:{crawl_id}")
+    _running_site_crawls[crawl_id] = task
+
+    def _done(finished: asyncio.Task[None]) -> None:
+        _running_site_crawls.pop(crawl_id, None)
+        _stop_requested.discard(crawl_id)
+        if not finished.cancelled() and finished.exception() is not None:
+            # run_site_crawl records its own failures; anything reaching here is a
+            # bug in the recording, so it must not vanish silently.
+            logger.error("Site crawl %s task raised", crawl_id, exc_info=finished.exception())
+
+    task.add_done_callback(_done)
+
+
+def request_site_crawl_stop(crawl_id: str) -> bool:
+    """Ask a running crawl to finish now. True when there was one to ask.
+
+    Cooperative on purpose: cancelling the task would lose the pages already
+    fetched but not yet written. The crawl checks this between pages and exits
+    through its normal completion path, so the partial result is kept.
+    """
+    if crawl_id not in _running_site_crawls:
+        return False
+    _stop_requested.add(crawl_id)
+    return True
+
+
+def site_crawl_is_running(crawl_id: str) -> bool:
+    return crawl_id in _running_site_crawls
+
+
+async def wait_for_site_crawl(crawl_id: str) -> None:
+    """Await a scheduled crawl if it is still running here.
+
+    Production never needs this - the client polls the row. It exists for tests,
+    which must not race a task that is deliberately no longer tied to the
+    request, and for a future graceful shutdown that would rather drain than cut.
+    """
+    task = _running_site_crawls.get(crawl_id)
+    if task is not None:
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def site_page_record(page: CrawledPage, *, crawl_id: str, host: str) -> dict[str, Any]:
@@ -595,6 +658,9 @@ class _SiteProgress:
                         not_attempted=stats.not_attempted,
                         seeded_from_sitemap=stats.seeded_from_sitemap,
                         max_depth_seen=stats.max_depth_seen,
+                        # Proof of life, so another process cannot mistake this
+                        # crawl for the wreckage of a dead one.
+                        heartbeat_at=datetime.now(UTC),
                     )
                 )
                 await session.commit()
@@ -615,6 +681,7 @@ async def _begin_site_crawl(crawl_id: str) -> tuple[str, CrawlLimits] | None:
             return None
         row.status = "crawling"
         row.started_at = datetime.now(UTC)
+        row.heartbeat_at = row.started_at
         await session.commit()
         limits = CrawlLimits.from_settings(
             get_settings(), max_pages=row.max_pages, max_depth=row.max_depth, **(row.options or {})
@@ -634,11 +701,14 @@ async def _record_site_probe(crawl_id: str, *, start_url: str, host: str, site_n
 
 
 def _site_terminal_status(stats: CrawlStats) -> str:
-    """failed: nothing fetched. complete: the whole site, inside every bound. else partial.
+    """stopped: a person asked. failed: nothing fetched. complete: the whole site. else partial.
 
     "partial" is not a failure - it is the honest answer for a site bigger than
-    the budget, and the counters say which bound bound first.
+    the budget, and the counters say which bound bound first. "stopped" is
+    separate from both because nothing went wrong.
     """
+    if stats.stopped_by_user:
+        return "stopped"
     if stats.fetched == 0:
         return "failed"
     if (stats.aborted_reason or stats.hit_page_budget or stats.deadline_hit
@@ -680,6 +750,8 @@ async def _finish_site_crawl(
                 target_pages=stats.targets,
                 navigation_pages=stats.navigation_pages,
                 skipped_page_type=stats.skipped_page_type,
+                throttled=stats.throttled,
+                gave_up_throttled=stats.gave_up_throttled,
                 pages_analyzed=stats.analyzed,
                 avg_score=stats.average_score,
                 critical_findings=stats.critical_findings,
@@ -768,6 +840,7 @@ async def run_site_crawl(crawl_id: str) -> None:
                 async for page in crawl_site(
                     client, probe.start_url, robots=probe.robots, limits=limits, stats=stats,
                     page_hook=make_page_hook(analyzers, stats) if analyzers else None,
+                    should_stop=lambda: crawl_id in _stop_requested,
                 ):
                     buffer.append(site_page_record(page, crawl_id=crawl_id, host=probe.host))
                     linked.update(page.outlinks)
@@ -834,17 +907,27 @@ async def run_site_crawl(crawl_id: str) -> None:
 
 
 async def reconcile_orphaned_site_crawls() -> int:
-    """Fail site crawls left mid-flight by a previous process. Called once at startup.
+    """Fail site crawls whose worker has gone quiet. Called once at startup.
 
-    Same reasoning as reconcile_orphaned_audits. As with catalog crawls, the pages
-    already written to MongoDB SURVIVE, so the job is marked failed while a partial
-    page set stays readable - the UI should say "interrupted", not "no data".
+    Only rows with a STALE heartbeat are claimed. Failing every non-terminal row
+    was actively destructive: a second process starting against the same database
+    - including one that immediately dies because the port is taken - would mark
+    a healthy running crawl as failed, which looked exactly like the crawler
+    giving up halfway.
+
+    A row with no heartbeat at all predates the column, so it is stale by
+    definition. The pages already written to MongoDB survive either way, so a
+    reconciled crawl still has a readable partial result.
     """
+    cutoff = datetime.now(UTC) - timedelta(seconds=SITE_CRAWL_STALE_AFTER_S)
     try:
         async with async_session_factory() as session:
             result = await session.execute(
                 update(SiteCrawl)
-                .where(SiteCrawl.status.in_(_NON_TERMINAL_SITE_CRAWL))
+                .where(
+                    SiteCrawl.status.in_(_NON_TERMINAL_SITE_CRAWL),
+                    or_(SiteCrawl.heartbeat_at.is_(None), SiteCrawl.heartbeat_at < cutoff),
+                )
                 .values(
                     status="failed",
                     error_message="The server restarted before this crawl finished.",

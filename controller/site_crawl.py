@@ -30,6 +30,10 @@ async def get_site_crawl(crawl_id: str, session: AsyncSession) -> SiteCrawlStatu
     return await site_crawl_service.get_site_crawl(crawl_id, session)
 
 
+async def stop_site_crawl(crawl_id: str, session: AsyncSession) -> SiteCrawlStatusResponse:
+    return await site_crawl_service.stop_site_crawl(crawl_id, session)
+
+
 async def list_site_crawls(
     session: AsyncSession, *, host: str | None, limit: int
 ) -> SiteCrawlListResponse:

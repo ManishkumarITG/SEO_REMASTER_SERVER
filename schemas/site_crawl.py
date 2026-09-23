@@ -18,7 +18,9 @@ from pydantic import BaseModel, Field, field_validator
 
 from services.crawler.urls import normalize_seed_url
 
-SiteCrawlStatus = Literal["pending", "crawling", "complete", "partial", "failed"]
+#: "stopped" is its own outcome: a person pressed Stop, which is not a failure
+#: and not a limitation to work around.
+SiteCrawlStatus = Literal["pending", "crawling", "complete", "partial", "failed", "stopped"]
 #: Catalog page types a crawl can be restricted to. An empty list means every
 #: page, which is the default.
 SiteCrawlPageType = Literal["product", "collection"]
@@ -126,6 +128,11 @@ class SiteCrawlStatusResponse(BaseModel):
     target_pages: int = 0
     navigation_pages: int = 0
     skipped_page_type: int = 0
+
+    #: Responses asking us to slow down, and pages finally abandoned to them.
+    #: A crawl is never aborted over throttling; these say what it cost.
+    throttled: int = 0
+    gave_up_throttled: int = 0
 
     pages_persisted: int = 0
     persistence_ok: bool = True

@@ -253,6 +253,14 @@ class CrawlStats:
     #: URLs skipped outright because their type was outside the filter.
     skipped_page_type: int = 0
     hit_navigation_budget: bool = False
+    #: Responses that told us to slow down, and pages finally abandoned because
+    #: the host never stopped saying it. Reported so "we got 280 of your 300
+    #: pages, the rest were rate-limited" is a sentence the UI can say.
+    throttled: int = 0
+    gave_up_throttled: int = 0
+    #: A person pressed Stop. Distinguished from every other early exit because
+    #: it is the only one that is not a limitation to report or work around.
+    stopped_by_user: bool = False
     #: Pages an analyzer actually scored, and the running total of their scores.
     #: Summed rather than averaged as we go, so the mean is exact at the end
     #: instead of drifting through repeated division.

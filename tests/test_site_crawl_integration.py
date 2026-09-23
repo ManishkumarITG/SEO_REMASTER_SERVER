@@ -22,6 +22,7 @@ import db.site_pages as site_pages
 import main
 from db.session import async_session_factory, init_db
 from models.db import SiteCrawl
+from workers.tasks import run_site_crawl
 
 HOST = "crawlme.test"
 ORIGIN = f"https://{HOST}"
@@ -74,6 +75,13 @@ def fake_mongo(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, Any]]:
 
     monkeypatch.setattr(tasks, "save_pages", save_pages)
     monkeypatch.setattr(tasks, "mark_orphans", mark_orphans)
+
+    # The POST schedules the crawl on the TestClient event loop, which stops as
+    # soon as the response is sent. Each test awaits `run_site_crawl` itself
+    # instead, so the whole chain still runs - just in the test loop.
+    import services.site_crawl_service as service
+
+    monkeypatch.setattr(service, "schedule_site_crawl", lambda crawl_id: None)
     return store
 
 
@@ -116,6 +124,7 @@ async def test_a_crawl_runs_end_to_end_from_one_post(fake_mongo: dict[str, dict[
     created = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20, "max_depth": 3})
     assert created.status_code == 202
     crawl_id = created.json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     # The background task has already run by the time the response is returned.
     row = await _row(crawl_id)
@@ -137,7 +146,8 @@ async def test_robots_and_assets_are_refused_without_a_request(
     mock_site()
     admin = respx.get(f"{ORIGIN}/admin/panel").mock(return_value=html(page("Admin")))
     client = TestClient(main.app)
-    client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20})
+    crawl_id = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20}).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     assert admin.call_count == 0, "robots.txt disallows /admin"
     assert fake_mongo[f"{ORIGIN}/admin/panel"]["skipped"] == "robots"
@@ -154,6 +164,7 @@ async def test_the_sitemap_only_page_is_found_and_flagged_as_an_orphan(
     mock_site()
     client = TestClient(main.app)
     crawl_id = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20}).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     assert fake_mongo[f"{ORIGIN}/secret-landing"]["orphan"] is True
     assert fake_mongo[f"{ORIGIN}/about"]["orphan"] is False  # the home page links to it
@@ -169,6 +180,7 @@ async def test_the_status_endpoint_reports_the_finished_crawl(
     mock_site()
     client = TestClient(main.app)
     crawl_id = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20}).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     body = client.get(f"/api/site-crawls/{crawl_id}").json()
     assert body["progress_pct"] == 100
@@ -186,7 +198,8 @@ async def test_the_status_endpoint_reports_the_finished_crawl(
 async def test_page_facts_survive_the_whole_round_trip(fake_mongo: dict[str, dict[str, Any]]) -> None:
     await init_db()
     mock_site()
-    TestClient(main.app).post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20})
+    created = TestClient(main.app).post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20})
+    await run_site_crawl(created.json()["crawl_id"])
 
     home = fake_mongo[f"{ORIGIN}/"]
     assert home["title"] == "Home"
@@ -211,6 +224,7 @@ async def test_a_page_budget_smaller_than_the_site_finishes_partial(
     mock_site()
     client = TestClient(main.app)
     crawl_id = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 2}).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     body = client.get(f"/api/site-crawls/{crawl_id}").json()
     assert body["status"] == "partial"
@@ -231,6 +245,7 @@ async def test_every_crawled_page_is_scored_by_the_analyzers(
     mock_site()
     client = TestClient(main.app)
     crawl_id = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20}).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     home = fake_mongo[f"{ORIGIN}/"]
     assert home["score"] is not None and 0 <= home["score"] <= 100
@@ -251,7 +266,8 @@ async def test_a_page_with_no_description_scores_below_one_with_a_description(
     """The score has to move with the content, or it is decoration."""
     await init_db()
     mock_site()
-    TestClient(main.app).post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20})
+    created = TestClient(main.app).post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20})
+    await run_site_crawl(created.json()["crawl_id"])
 
     with_meta = fake_mongo[f"{ORIGIN}/about"]  # has a meta description
     without_meta = fake_mongo[f"{ORIGIN}/secret-landing"]  # has none
@@ -268,6 +284,7 @@ async def test_findings_are_kept_out_of_the_page_list_but_not_the_detail(
     mock_site()
     client = TestClient(main.app)
     crawl_id = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20}).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     # The list schema carries the counts and the score, never the findings array.
     from schemas import SiteCrawlPage
@@ -289,6 +306,7 @@ async def test_analyzers_can_be_switched_off(
     monkeypatch.setattr(tasks, "bulk_analyzers", lambda names: [])
     client = TestClient(main.app)
     crawl_id = client.post("/api/site-crawls", json={"start_url": ORIGIN, "max_pages": 20}).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     assert fake_mongo[f"{ORIGIN}/"]["score"] is None
     body = client.get(f"/api/site-crawls/{crawl_id}").json()
@@ -344,6 +362,7 @@ async def test_a_products_only_crawl_audits_product_pages_and_nothing_else(
         "/api/site-crawls",
         json={"start_url": STORE, "max_pages": 20, "page_types": ["product"]},
     ).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     assert _targets(fake_mongo) == {f"{STORE}/products/linen-shirt", f"{STORE}/products/wool-scarf"}
     body = client.get(f"/api/site-crawls/{crawl_id}").json()
@@ -366,6 +385,7 @@ async def test_a_collections_only_crawl_audits_collection_pages(
         "/api/site-crawls",
         json={"start_url": STORE, "max_pages": 20, "page_types": ["collection"]},
     ).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     assert _targets(fake_mongo) == {f"{STORE}/collections/summer"}
     assert client.get(f"/api/site-crawls/{crawl_id}").json()["target_pages"] == 1
@@ -382,6 +402,7 @@ async def test_both_types_audits_products_and_collections(
         "/api/site-crawls",
         json={"start_url": STORE, "max_pages": 20, "page_types": ["product", "collection"]},
     ).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     assert _targets(fake_mongo) == {
         f"{STORE}/collections/summer",
@@ -406,6 +427,7 @@ async def test_the_page_list_hides_navigation_pages_by_default(
         "/api/site-crawls",
         json={"start_url": STORE, "max_pages": 20, "page_types": ["product"]},
     ).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     # The real Mongo reads are stubbed out in this module, so assert on what was
     # stored: the page list filters on exactly this field.
@@ -428,6 +450,7 @@ async def test_a_store_with_no_matching_pages_says_so_instead_of_failing(
         "/api/site-crawls",
         json={"start_url": ORIGIN, "max_pages": 20, "page_types": ["product"]},
     ).json()["crawl_id"]
+    await run_site_crawl(crawl_id)
 
     body = client.get(f"/api/site-crawls/{crawl_id}").json()
     assert body["target_pages"] == 0

@@ -97,7 +97,12 @@ class Settings(BaseSettings):
     site_crawl_max_pages: int = 500
     site_crawl_max_depth: int = 5
     site_crawl_concurrency: int = 6
-    site_crawl_deadline_s: int = 10 * 60
+    # 30 minutes, not 10. A measured 298-page crawl of a real store took 537s, so
+    # 600s was about to become the binding limit on any site slightly larger -
+    # and now that a 429 is answered by waiting rather than giving up, a
+    # rate-limited crawl legitimately needs longer. The Stop button is the
+    # interruption that matters; this is only the backstop.
+    site_crawl_deadline_s: int = 30 * 60
     #: Floor between request starts. robots Crawl-delay raises it, never lowers it.
     site_crawl_min_interval_s: float = 0.1
     #: Off by default: a crawl seeded at example.com that wanders into

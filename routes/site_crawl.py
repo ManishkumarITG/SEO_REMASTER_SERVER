@@ -9,7 +9,7 @@ with the parameter.
 from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from controller import site_crawl as site_crawl_controller
@@ -107,6 +107,26 @@ async def get_site_crawl_page(
 ) -> SiteCrawlPageDetail:
     """One page with its outgoing links and the pages that link to it."""
     return await site_crawl_controller.get_site_crawl_page(crawl_id, url, session)
+
+
+@router.get("/{crawl_id}/report.html")
+async def generate_site_crawl_report(
+    crawl_id: str, session: AsyncSession = Depends(get_session)
+) -> Response:
+    """Generate an AI SEO audit report and download it as a standalone HTML file.
+
+    The report is built WHEN THIS IS CALLED: Gemini reads the crawl's real figures
+    and writes the analysis, which takes a few seconds. Nothing is stored.
+    """
+    document, filename = await site_crawl_controller.generate_site_crawl_report(crawl_id, session)
+    return Response(
+        content=document,
+        media_type="text/html; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
 
 
 @router.get("/{crawl_id}/templates", response_model=SiteCrawlTemplatesResponse)

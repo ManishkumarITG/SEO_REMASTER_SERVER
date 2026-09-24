@@ -26,6 +26,9 @@ logger = logging.getLogger("seo.gemini")
 #: google-genai takes the HTTP timeout in MILLISECONDS, not seconds.
 _TIMEOUT_MS = 60_000
 _MAX_OUTPUT_TOKENS = 2048
+#: A full audit report is far longer than a Reddit draft, so the text path takes
+#: its own, larger ceiling rather than the structured default above.
+_MAX_REPORT_TOKENS = 8192
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -68,6 +71,51 @@ class GeminiService:
                 http_options=types.HttpOptions(timeout=_TIMEOUT_MS),
             )
         return self._client
+
+    async def generate_text(
+        self,
+        *,
+        prompt: str,
+        system_instruction: str,
+        temperature: float = 0.4,
+        max_output_tokens: int = _MAX_REPORT_TOKENS,
+    ) -> str:
+        """One free-text call, returning the model's text as-is.
+
+        Separate from `generate_structured` because a report is prose, not JSON:
+        no schema, no validation, no retry-for-shape. Errors are still funnelled
+        into GeminiError so a route maps them to 502 rather than a bare 500, and
+        an empty reply (a safety block, or a stop before any token) is surfaced as
+        GeminiResponseError so the caller never ships a blank file.
+        """
+        from google.genai import errors as genai_errors
+        from google.genai import types
+
+        client = self._get_client()
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        try:
+            response = await client.aio.models.generate_content(
+                model=self.model, contents=prompt, config=config
+            )
+        except genai_errors.APIError as exc:
+            logger.warning("Gemini API error (%s): %s", type(exc).__name__, exc)
+            raise GeminiError(f"Gemini request failed: {getattr(exc, 'message', exc)}") from exc
+        except Exception as exc:  # noqa: BLE001 - httpx errors are not APIError; see generate_structured
+            logger.warning("Gemini call failed (%s): %s", type(exc).__name__, exc)
+            raise GeminiError(f"Gemini request failed: {type(exc).__name__}") from exc
+
+        try:
+            text = (response.text or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gemini reply had no readable text (%s): %s", type(exc).__name__, exc)
+            text = ""
+        if not text:
+            raise GeminiResponseError("Gemini returned an empty reply", raw="")
+        return text
 
     async def generate_structured(
         self,

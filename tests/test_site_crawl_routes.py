@@ -570,3 +570,69 @@ async def test_navigation_pages_are_excluded_from_an_export_by_default(
     client.get(f"/api/site-crawls/{row.id}/export.csv")
     client.get(f"/api/site-crawls/{row.id}/export.csv", params={"include_navigation": "true"})
     assert seen == [False, True]
+
+
+# --- Gemini report endpoint -----------------------------------------------------------
+
+
+async def test_the_report_endpoint_downloads_a_named_html_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = await _seed_row(status="complete", host="shop.example.com", pages_fetched=3)
+
+    async def fake_generate(crawl_id, session):
+        assert crawl_id == row.id
+        return b"<!doctype html><html><body>report</body></html>", "sitecrawl-shop.example.com-report.html"
+
+    monkeypatch.setattr(service, "generate_site_crawl_report", fake_generate)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "report.html" in response.headers["content-disposition"]
+    assert "Content-Disposition" in response.headers.get("access-control-expose-headers", "")
+    assert b"<!doctype html>" in response.content
+
+
+async def test_generating_a_report_for_a_running_crawl_is_refused() -> None:
+    row = await _seed_row(status="crawling", heartbeat_at=datetime.now(UTC))
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html")
+    assert response.status_code == 409
+    assert "still crawling" in response.json()["detail"]
+
+
+async def test_report_without_gemini_configured_is_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+    from exceptions.gemini import GeminiNotConfigured
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+
+    async def unconfigured(r):
+        raise GeminiNotConfigured("no key")
+
+    async def payload(r):
+        return {}
+
+    monkeypatch.setattr(report_mod, "build_payload", payload)
+    monkeypatch.setattr(report_mod, "generate_report_html", unconfigured)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html")
+    assert response.status_code == 503
+    assert "GEMINI_API_KEY" in response.json()["detail"]
+
+
+async def test_report_when_gemini_fails_is_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+    from exceptions.gemini import GeminiError
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+
+    async def failing(r):
+        raise GeminiError("upstream boom")
+
+    monkeypatch.setattr(report_mod, "generate_report_html", failing)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html")
+    assert response.status_code == 502
+    assert "Gemini" in response.json()["detail"]
+
+
+async def test_report_for_an_unknown_crawl_is_404() -> None:
+    assert _client().get(f"/api/site-crawls/{uuid4()}/report.html").status_code == 404

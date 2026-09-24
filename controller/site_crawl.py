@@ -79,3 +79,7 @@ async def get_site_crawl_export(
     return await site_crawl_service.get_site_crawl_export(
         crawl_id, session, fmt=fmt, include_navigation=include_navigation
     )
+
+
+async def generate_site_crawl_report(crawl_id: str, session: AsyncSession) -> tuple[bytes, str]:
+    return await site_crawl_service.generate_site_crawl_report(crawl_id, session)

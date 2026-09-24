@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import get_settings
 from db import site_pages
 from exceptions.crawler import FetchError
+from exceptions.gemini import GeminiError, GeminiNotConfigured
 from exceptions.stores import RobotsDisallowed
 from models.db import SiteCrawl
 from schemas import (
@@ -46,7 +47,7 @@ from schemas import (
     page_from_doc,
     template_from_doc,
 )
-from services import site_crawl_export
+from services import site_crawl_export, site_crawl_report
 from services.crawler.http_client import crawl_client
 from services.crawler.models import CrawlLimits
 from services.crawler.site_crawl import probe_site
@@ -436,6 +437,31 @@ async def get_site_crawl_export(
         "application/json; charset=utf-8",
         site_crawl_export.export_filename(row, "json"),
     )
+
+
+async def generate_site_crawl_report(crawl_id: str, session: AsyncSession) -> tuple[bytes, str]:
+    """-> (HTML bytes, filename) for a Gemini-written audit report.
+
+    503 when Gemini is not configured, 409 when the crawl is not finished, 502
+    when Gemini itself fails - the report is generated live, so a model outage is
+    a gateway failure, not ours.
+    """
+    row = await _require_crawl(crawl_id, session)
+    if row.status not in _TERMINAL:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This crawl is still {row.status}. Wait for it to finish before generating a report.",
+        )
+    try:
+        return await site_crawl_report.generate_report_html(row)
+    except GeminiNotConfigured as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Report generation is unavailable: GEMINI_API_KEY is not set.",
+        ) from exc
+    except GeminiError as exc:
+        # The gateway already stripped anything sensitive from the message.
+        raise HTTPException(status_code=502, detail=f"Gemini could not generate the report: {exc}") from exc
 
 
 async def get_site_crawl_issues(crawl_id: str, session: AsyncSession) -> SiteCrawlIssuesResponse:

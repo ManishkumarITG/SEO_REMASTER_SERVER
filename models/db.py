@@ -251,6 +251,10 @@ class SiteCrawl(Base):
     #: same reason as the counters above: added after the table existed.
     throttled: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     gave_up_throttled: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    #: Distinct templates seen, and how many got a Lighthouse report. The reports
+    #: themselves live in MongoDB (db/site_pages.TEMPLATES_COLLECTION).
+    templates_found: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    templates_measured: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
 
     # --- analysis ----------------------------------------------------------------------
     #: Pages an analyzer scored, and the mean of their scores. A null avg_score

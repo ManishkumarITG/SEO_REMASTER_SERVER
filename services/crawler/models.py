@@ -68,6 +68,17 @@ class CrawledPage(BaseModel):
     word_count: int = 0
     images: int = 0
     images_missing_alt: int = 0
+    #: The full H1-H6 outline in document order: [{"level": 2, "text": "..."}].
+    #: The counts above say a page HAS headings; only the sequence shows that it
+    #: jumps H1 -> H3 and breaks the outline.
+    headings: list[dict[str, Any]] = Field(default_factory=list)
+    #: Headings found, which can exceed len(headings) when the page is absurd.
+    heading_count: int = 0
+    #: Transitions that skipped a level going down. 0 is a well-formed outline.
+    heading_skips: int = 0
+    #: Main body text, page chrome stripped, capped by `CrawlLimits.text_chars`.
+    #: The markup is never kept, so this is the only record of what the page said.
+    text_content: str = ""
 
     # --- graph --------------------------------------------------------------------
     internal_links: int = 0
@@ -97,6 +108,10 @@ class CrawledPage(BaseModel):
     # --- catalog classification ---------------------------------------------------
     #: "product" | "collection" | "" (anything else), from the URL path alone.
     page_type: str = ""
+    #: Which template rendered the page - "product", "collection", "home", ... See
+    #: services/crawler/templates.py. Anything whose cost is per-template rather
+    #: than per-page groups on this.
+    template: str = ""
     #: False for a page fetched only to find links, because a page-type filter was
     #: active and this page was not one of the wanted types. Such a page is real
     #: and was really fetched - it is just not part of the answer, so it is
@@ -160,6 +175,10 @@ class CrawlLimits:
     #: sitemap that no crawled page links to has no internal path to it.
     seed_from_sitemap: bool = True
     max_links_per_page: int = 300
+    #: Characters of main body text stored per page, chrome stripped. 0 stores
+    #: none. 500 pages x 8,000 chars is about 4 MB, which is affordable; the raw
+    #: MARKUP still is not, and is still never kept.
+    text_chars: int = 8000
     #: Restrict the crawl to catalog page types: ("product",), ("collection",) or
     #: both. Empty means every page, which is the default and the old behaviour.
     #:
@@ -178,6 +197,7 @@ class CrawlLimits:
         # 0 survives as "no limit"; anything else is floored at 1 so a negative
         # cannot quietly become unlimited.
         self.max_pages = max(0, int(self.max_pages))
+        self.text_chars = max(0, int(self.text_chars))
         self.max_depth = max(0, int(self.max_depth))
         self.concurrency = max(1, int(self.concurrency))
         self.max_navigation_pages = max(0, int(self.max_navigation_pages))
@@ -208,7 +228,7 @@ class CrawlLimits:
         mapped = {
             field_name: getattr(settings, f"site_crawl_{field_name}")
             for field_name in ("max_pages", "max_depth", "concurrency", "min_interval_s",
-                               "include_subdomains")
+                               "include_subdomains", "text_chars")
             if hasattr(settings, f"site_crawl_{field_name}")
         }
         if hasattr(settings, "site_crawl_deadline_s"):

@@ -8,6 +8,7 @@ reads are stubbed on `db.site_pages`.
 
 from __future__ import annotations
 
+import codecs
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -386,3 +387,186 @@ async def test_stopping_a_finished_crawl_is_not_an_error() -> None:
 
 def test_stopping_an_unknown_crawl_is_404() -> None:
     assert _client().post(f"/api/site-crawls/{uuid4()}/stop").status_code == 404
+
+
+# --- templates endpoint ---------------------------------------------------------------
+
+
+async def test_the_templates_endpoint_returns_one_record_per_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = await _seed_row(status="complete", templates_found=2, templates_measured=1)
+
+    async def load_template_reports(crawl_id):
+        assert crawl_id == row.id
+        return [
+            {"template": "product", "page_count": 200, "representative_url": "https://s/products/x",
+             "median_words": 480, "sample_urls": ["https://s/products/x"],
+             "lighthouse": {"performance_score": 71, "seo_score": 92}, "error": ""},
+            {"template": "blog", "page_count": 3, "representative_url": "",
+             "median_words": 0, "sample_urls": [], "lighthouse": None,
+             "error": "not tested - only the first 8 templates are measured"},
+        ]
+
+    monkeypatch.setattr(site_pages, "load_template_reports", load_template_reports)
+    body = _client().get(f"/api/site-crawls/{row.id}/templates").json()
+    assert [t["template"] for t in body["templates"]] == ["product", "blog"]
+    assert body["templates"][0]["lighthouse"]["performance_score"] == 71
+    assert body["templates"][0]["page_count"] == 200
+    assert body["templates"][1]["lighthouse"] is None
+    assert body["found"] == 2 and body["measured"] == 1
+
+
+async def test_a_crawl_that_measured_nothing_is_not_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Template measurement can be switched off; that is a legitimate answer."""
+    row = await _seed_row(status="complete")
+
+    async def none(crawl_id):
+        return []
+
+    monkeypatch.setattr(site_pages, "load_template_reports", none)
+    response = _client().get(f"/api/site-crawls/{row.id}/templates")
+    assert response.status_code == 200
+    assert response.json()["templates"] == []
+
+
+async def test_templates_of_an_unknown_crawl_are_404() -> None:
+    assert _client().get(f"/api/site-crawls/{uuid4()}/templates").status_code == 404
+
+
+async def test_mongo_down_on_templates_answers_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = await _seed_row(status="complete")
+
+    async def boom(crawl_id):
+        raise ServerSelectionTimeoutError("no servers")
+
+    monkeypatch.setattr(site_pages, "load_template_reports", boom)
+    assert _client().get(f"/api/site-crawls/{row.id}/templates").status_code == 503
+
+
+async def test_the_page_list_carries_the_template_and_heading_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = await _seed_row(status="complete")
+
+    async def load_pages(crawl_id, *, limit, offset, sort, issue, include_navigation):
+        return [{"url": "https://s/products/x", "template": "product",
+                 "heading_count": 7, "heading_skips": 1}], 1
+
+    monkeypatch.setattr(site_pages, "load_pages", load_pages)
+    page = _client().get(f"/api/site-crawls/{row.id}/pages").json()["pages"][0]
+    assert page["template"] == "product"
+    assert page["heading_count"] == 7 and page["heading_skips"] == 1
+
+
+async def test_the_page_detail_carries_the_outline_and_the_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = await _seed_row(status="complete")
+
+    async def load_page(crawl_id, url):
+        return {"url": url, "title": "A", "template": "product",
+                "headings": [{"level": 1, "text": "Linen Shirt"}, {"level": 3, "text": "Care"}],
+                "text_content": "A breathable shirt made from European flax."}
+
+    async def load_inlinks(crawl_id, url, limit=100):
+        return []
+
+    monkeypatch.setattr(site_pages, "load_page", load_page)
+    monkeypatch.setattr(site_pages, "load_inlinks", load_inlinks)
+    body = _client().get(f"/api/site-crawls/{row.id}/page", params={"url": "https://s/p"}).json()
+    assert [h["level"] for h in body["headings"]] == [1, 3]
+    assert "European flax" in body["text_content"]
+
+
+# --- export endpoint ------------------------------------------------------------------
+
+
+@pytest.fixture
+def _export_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def iter_pages(crawl_id, *, include_navigation=False, batch_size=200):
+        yield [{"url": "https://s/a", "title": "A", "status_code": 200, "depth": 0}]
+
+    async def load_template_reports(crawl_id):
+        return []
+
+    async def issue_counts(crawl_id):
+        return {}
+
+    monkeypatch.setattr(site_pages, "iter_pages", iter_pages)
+    monkeypatch.setattr(site_pages, "load_template_reports", load_template_reports)
+    monkeypatch.setattr(site_pages, "issue_counts", issue_counts)
+
+
+async def test_the_csv_export_downloads_as_a_named_file(_export_stubs: None) -> None:
+    row = await _seed_row(status="complete", host="shop.example.com", pages_fetched=1)
+    response = _client().get(f"/api/site-crawls/{row.id}/export.csv")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    disposition = response.headers["content-disposition"]
+    assert disposition.startswith("attachment;")
+    assert ".csv" in disposition and "shop.example.com" in disposition
+    # The browser fetches this cross-origin, so the page must be able to read it.
+    assert "Content-Disposition" in response.headers.get("access-control-expose-headers", "")
+    assert response.content.startswith(codecs.BOM_UTF8)
+    assert b"https://s/a" in response.content
+
+
+async def test_the_json_export_downloads_as_a_named_file(_export_stubs: None) -> None:
+    row = await _seed_row(status="complete", host="shop.example.com", pages_fetched=1)
+    response = _client().get(f"/api/site-crawls/{row.id}/export.json")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert ".json" in response.headers["content-disposition"]
+    doc = response.json()
+    assert doc["crawl"]["host"] == "shop.example.com"
+    assert [p["url"] for p in doc["pages"]] == ["https://s/a"]
+
+
+async def test_exporting_a_running_crawl_is_refused(_export_stubs: None) -> None:
+    """An export of a half-finished crawl is indistinguishable from a finished one."""
+    row = await _seed_row(status="crawling", heartbeat_at=datetime.now(UTC))
+    response = _client().get(f"/api/site-crawls/{row.id}/export.csv")
+    assert response.status_code == 409
+    assert "still crawling" in response.json()["detail"]
+
+
+async def test_a_stopped_crawl_can_still_be_exported(_export_stubs: None) -> None:
+    """Stopping is a terminal outcome, and its pages are worth downloading."""
+    row = await _seed_row(status="stopped", pages_fetched=1)
+    assert _client().get(f"/api/site-crawls/{row.id}/export.csv").status_code == 200
+
+
+async def test_exporting_an_unknown_crawl_is_404() -> None:
+    assert _client().get(f"/api/site-crawls/{uuid4()}/export.csv").status_code == 404
+
+
+async def test_an_unsupported_export_format_is_rejected() -> None:
+    row = await _seed_row(status="complete")
+    assert _client().get(f"/api/site-crawls/{row.id}/export.xlsx").status_code == 422
+
+
+async def test_navigation_pages_are_excluded_from_an_export_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = await _seed_row(status="complete")
+    seen: list[bool] = []
+
+    async def iter_pages(crawl_id, *, include_navigation=False, batch_size=200):
+        seen.append(include_navigation)
+        return
+        yield  # pragma: no cover - makes this an async generator
+
+    async def empty(crawl_id):
+        return []
+
+    monkeypatch.setattr(site_pages, "iter_pages", iter_pages)
+    monkeypatch.setattr(site_pages, "load_template_reports", empty)
+    monkeypatch.setattr(site_pages, "issue_counts", lambda cid: empty(cid))
+
+    client = _client()
+    client.get(f"/api/site-crawls/{row.id}/export.csv")
+    client.get(f"/api/site-crawls/{row.id}/export.csv", params={"include_navigation": "true"})
+    assert seen == [False, True]

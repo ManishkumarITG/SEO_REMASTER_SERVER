@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 from fastapi import BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +15,7 @@ from schemas import (
     SiteCrawlPageDetail,
     SiteCrawlPagesResponse,
     SiteCrawlStatusResponse,
+    SiteCrawlTemplatesResponse,
 )
 from services import site_crawl_service
 
@@ -62,3 +65,17 @@ async def get_site_crawl_page(crawl_id: str, url: str, session: AsyncSession) ->
 
 async def get_site_crawl_issues(crawl_id: str, session: AsyncSession) -> SiteCrawlIssuesResponse:
     return await site_crawl_service.get_site_crawl_issues(crawl_id, session)
+
+
+async def get_site_crawl_templates(
+    crawl_id: str, session: AsyncSession
+) -> SiteCrawlTemplatesResponse:
+    return await site_crawl_service.get_site_crawl_templates(crawl_id, session)
+
+
+async def get_site_crawl_export(
+    crawl_id: str, session: AsyncSession, *, fmt: str, include_navigation: bool
+) -> tuple[AsyncIterator[bytes], str, str]:
+    return await site_crawl_service.get_site_crawl_export(
+        crawl_id, session, fmt=fmt, include_navigation=include_navigation
+    )

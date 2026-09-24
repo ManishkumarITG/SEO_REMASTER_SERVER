@@ -114,6 +114,15 @@ class Settings(BaseSettings):
     # runs or 500 LLM completions. services/site_crawl_analysis.py refuses any
     # name outside its bulk-safe set. Empty string turns page scoring off.
     site_crawl_analyzers: str = "on_page,technical"
+    # One Lighthouse run per TEMPLATE once the page walk is finished, not one per
+    # page: a store has hundreds of product pages and one product template, and a
+    # PSI run costs 10-30s. Off means no PageSpeed calls at all from a crawl.
+    site_crawl_template_lighthouse: bool = True
+    site_crawl_max_templates: int = 8
+    site_crawl_lighthouse_strategy: str = "mobile"
+    # Characters of main body text kept per page, page chrome stripped. 0 stores
+    # none. The raw markup is never kept either way.
+    site_crawl_text_chars: int = 8000
 
     @property
     def cors_origin_list(self) -> list[str]:

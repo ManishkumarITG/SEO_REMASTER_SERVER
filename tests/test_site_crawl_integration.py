@@ -82,6 +82,23 @@ def fake_mongo(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, Any]]:
     import services.site_crawl_service as service
 
     monkeypatch.setattr(service, "schedule_site_crawl", lambda crawl_id: None)
+
+    # The template phase calls PageSpeed Insights for real; these tests stay offline.
+    async def build_template_reports(pages, **kwargs):
+        from services.site_crawl_templates import group_by_template
+
+        return [
+            {"template": g.template, "page_count": g.page_count,
+             "representative_url": g.representative, "median_words": g.median_words,
+             "sample_urls": g.urls[:20], "lighthouse": {"performance_score": 88}, "error": ""}
+            for g in group_by_template(pages)
+        ]
+
+    async def save_template_reports(crawl_id, records):
+        return len(records)
+
+    monkeypatch.setattr(tasks, "build_template_reports", build_template_reports)
+    monkeypatch.setattr(tasks, "save_template_reports", save_template_reports)
     return store
 
 

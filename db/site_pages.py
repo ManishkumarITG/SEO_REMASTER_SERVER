@@ -18,6 +18,7 @@ UI wants.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,13 +30,19 @@ from db.mongo import get_client, get_db
 logger = logging.getLogger("seo.mongo.site_pages")
 
 PAGES_COLLECTION = "site_crawl_pages"
+#: One doc per (crawl_id, template). A handful per crawl, not thousands.
+TEMPLATES_COLLECTION = "site_crawl_templates"
 
 #: Fields never returned by list reads: the link graph is far too large, and the
 #: raw robots directive string is detail only one page needs.
 #: `findings` is excluded too: 50 pages x 25 findings is a list response
-#: nobody reads. The per-page counts and score survive; the detail endpoint
-#: has the findings themselves.
-_LIST_PROJECTION = {"_id": 0, "outlinks": 0, "robots_meta": 0, "h1": 0, "findings": 0}
+#: nobody reads. So are `text_content` and `headings` - a page of body text
+#: times 50 rows is megabytes nobody scrolls. The per-page counts and score
+#: survive; the detail endpoint has all of it.
+_LIST_PROJECTION = {
+    "_id": 0, "outlinks": 0, "robots_meta": 0, "h1": 0, "findings": 0,
+    "text_content": 0, "headings": 0,
+}
 _DETAIL_PROJECTION = {"_id": 0}
 
 _SORTS: dict[str, list[tuple[str, int]]] = {
@@ -76,6 +83,13 @@ async def ensure_indexes() -> None:
         [("crawl_id", ASCENDING), ("score", ASCENDING), ("url", ASCENDING)], name="by_crawl_score"
     )
     await pages.create_index([("host", ASCENDING), ("crawled_at", DESCENDING)], name="by_host_recent")
+    # Grouping pages by template is how the per-template reports are read back.
+    await pages.create_index(
+        [("crawl_id", ASCENDING), ("template", ASCENDING)], name="by_crawl_template"
+    )
+    await get_db()[TEMPLATES_COLLECTION].create_index(
+        [("crawl_id", ASCENDING), ("template", ASCENDING)], unique=True, name="uniq_crawl_template"
+    )
     _indexed_client = client
 
 
@@ -135,6 +149,7 @@ ISSUE_FILTERS: dict[str, dict[str, Any]] = {
     "warning": {"warning_count": {"$gt": 0}},
     "product": {"page_type": "product"},
     "collection": {"page_type": "collection"},
+    "heading_skips": {"heading_skips": {"$gt": 0}},
 }
 
 #: Pages fetched only to reach the ones that were asked for. Excluded from
@@ -262,3 +277,69 @@ async def mark_orphans(crawl_id: str, urls: list[str]) -> int:
     except PyMongoError as exc:
         logger.warning("MongoDB mark_orphans failed (%s): %s", type(exc).__name__, exc)
         return 0
+
+
+async def save_template_reports(crawl_id: str, records: list[dict[str, Any]]) -> int:
+    """Upsert one record per template. Best-effort, like every write here."""
+    if not records:
+        return 0
+    now = datetime.now(UTC)
+    try:
+        await ensure_indexes()
+        operations = [
+            UpdateOne(
+                {"crawl_id": crawl_id, "template": record["template"]},
+                {"$set": {**record, "crawl_id": crawl_id, "measured_at": now}},
+                upsert=True,
+            )
+            for record in records
+        ]
+        result = await get_db()[TEMPLATES_COLLECTION].bulk_write(operations, ordered=False)
+        return (result.upserted_count or 0) + (result.matched_count or 0)
+    except PyMongoError as exc:
+        logger.warning("MongoDB save_template_reports failed (%s): %s", type(exc).__name__, exc)
+        return 0
+
+
+async def load_template_reports(crawl_id: str) -> list[dict[str, Any]]:
+    """Every template record for one crawl, most pages first."""
+    await ensure_indexes()
+    cursor = (
+        get_db()[TEMPLATES_COLLECTION]
+        .find({"crawl_id": crawl_id}, {"_id": 0})
+        .sort("page_count", DESCENDING)
+    )
+    return await cursor.to_list(100)
+
+
+#: Docs pulled per round trip when exporting. Big enough that a 5,000-page crawl
+#: is a handful of queries, small enough that no single batch is a memory event.
+EXPORT_BATCH = 200
+
+
+async def iter_pages(
+    crawl_id: str, *, include_navigation: bool = False, batch_size: int = EXPORT_BATCH
+) -> AsyncIterator[list[dict[str, Any]]]:
+    """Every page of a crawl, in batches, sorted stably.
+
+    Batched rather than `to_list()` because an export is the one read with no
+    natural limit: a 5,000-page crawl with its text and link graph is tens of
+    megabytes, and materialising all of it to serialise it would double that.
+    The caller streams each batch out and lets it go.
+
+    Sorted by url so an export is reproducible - a diff between two exports of
+    the same crawl should show data changes, not row shuffling.
+    """
+    await ensure_indexes()
+    query: dict[str, Any] = {"crawl_id": crawl_id}
+    if not include_navigation:
+        query.update(_TARGETS_ONLY)
+    cursor = get_db()[PAGES_COLLECTION].find(query, _DETAIL_PROJECTION).sort("url", ASCENDING)
+    batch: list[dict[str, Any]] = []
+    async for doc in cursor:
+        batch.append(doc)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch

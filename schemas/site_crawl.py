@@ -29,7 +29,7 @@ SiteCrawlIssue = Literal[
     "broken", "redirected", "noindex", "missing_title", "missing_description",
     "missing_canonical", "multiple_h1", "no_h1", "thin", "images_missing_alt",
     "blocked_by_robots", "failed", "orphan", "critical", "warning",
-    "product", "collection",
+    "product", "collection", "heading_skips",
 ]
 
 #: Hard ceilings on what one API caller may ask for, independent of the
@@ -134,6 +134,11 @@ class SiteCrawlStatusResponse(BaseModel):
     throttled: int = 0
     gave_up_throttled: int = 0
 
+    #: Distinct templates seen, and how many got a Lighthouse report. The reports
+    #: are on GET /api/site-crawls/{id}/templates.
+    templates_found: int = 0
+    templates_measured: int = 0
+
     pages_persisted: int = 0
     persistence_ok: bool = True
     notes: list[str] = Field(default_factory=list)
@@ -209,6 +214,13 @@ class SiteCrawlPage(BaseModel):
     warning_count: int = 0
     #: "product" | "collection" | "" - read from the URL path, not the markup.
     page_type: str = ""
+    #: Which template rendered the page: "product", "collection", "home", ...
+    template: str = ""
+    #: Headings found, and how many times the outline skipped a level going down.
+    #: The outline itself is on the detail response - 50 pages of headings is not
+    #: a list payload.
+    heading_count: int = 0
+    heading_skips: int = 0
     #: False for a page fetched only to reach the ones that were asked for.
     is_target: bool = True
     redirect_chain: list[str] = Field(default_factory=list)
@@ -225,6 +237,10 @@ class SiteCrawlPageDetail(SiteCrawlPage):
     analyzer_scores: dict[str, float | None] = Field(default_factory=dict)
     #: Non-passed findings, most urgent first. Same shape as an audit fix.
     findings: list[dict[str, Any]] = Field(default_factory=list)
+    #: The full H1-H6 outline in document order: [{"level": 2, "text": "..."}].
+    headings: list[dict[str, Any]] = Field(default_factory=list)
+    #: Main body text, page chrome stripped, capped by SITE_CRAWL_TEXT_CHARS.
+    text_content: str = ""
     outlinks: list[str] = Field(default_factory=list)
     #: Crawled pages that link TO this one. The other half of the graph, and what
     #: makes "why is this page not ranking" answerable.
@@ -268,3 +284,51 @@ def page_from_doc(doc: dict[str, Any]) -> SiteCrawlPage:
     """
     fields = SiteCrawlPage.model_fields
     return SiteCrawlPage(**{k: v for k, v in doc.items() if k in fields})
+
+
+class LighthouseReport(BaseModel):
+    """One Lighthouse pass, reduced to the numbers a report acts on."""
+
+    performance_score: int | None = None
+    accessibility_score: int | None = None
+    best_practices_score: int | None = None
+    seo_score: int | None = None
+    lcp_ms: float | None = None
+    inp_ms: float | None = None
+    cls: float | None = None
+    tbt_ms: float | None = None
+    fcp_ms: float | None = None
+    speed_index_ms: float | None = None
+    lighthouse_version: str = ""
+    strategy: str = ""
+    fetched_url: str = ""
+
+
+class SiteCrawlTemplate(BaseModel):
+    """One template, its pages, and the Lighthouse run for its representative page."""
+
+    template: str
+    page_count: int = 0
+    #: The page actually measured - the group's MEDIAN by word count, so an
+    #: outlier does not get to describe the whole template.
+    representative_url: str = ""
+    median_words: int = 0
+    sample_urls: list[str] = Field(default_factory=list)
+    lighthouse: LighthouseReport | None = None
+    #: Why there is no report, when there is none.
+    error: str = ""
+    measured_at: datetime | None = None
+
+
+class SiteCrawlTemplatesResponse(BaseModel):
+    crawl_id: str
+    host: str
+    templates: list[SiteCrawlTemplate] = Field(default_factory=list)
+    #: Templates seen versus templates a Lighthouse run was spent on.
+    found: int = 0
+    measured: int = 0
+
+
+def template_from_doc(doc: dict[str, Any]) -> SiteCrawlTemplate:
+    fields = SiteCrawlTemplate.model_fields
+    return SiteCrawlTemplate(**{k: v for k, v in doc.items() if k in fields})

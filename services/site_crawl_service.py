@@ -19,6 +19,7 @@ catalog crawls are.
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -41,8 +42,11 @@ from schemas import (
     SiteCrawlPagesResponse,
     SiteCrawlStatusResponse,
     SiteCrawlSummary,
+    SiteCrawlTemplatesResponse,
     page_from_doc,
+    template_from_doc,
 )
+from services import site_crawl_export
 from services.crawler.http_client import crawl_client
 from services.crawler.models import CrawlLimits
 from services.crawler.site_crawl import probe_site
@@ -126,6 +130,8 @@ def _status_response(row: SiteCrawl) -> SiteCrawlStatusResponse:
         skipped_page_type=row.skipped_page_type or 0,
         throttled=row.throttled or 0,
         gave_up_throttled=row.gave_up_throttled or 0,
+        templates_found=row.templates_found or 0,
+        templates_measured=row.templates_measured or 0,
         pages_analyzed=row.pages_analyzed or 0,
         avg_score=row.avg_score,
         grade=grade_for(row.avg_score) if row.avg_score is not None else None,
@@ -378,6 +384,58 @@ async def get_site_crawl_page(crawl_id: str, url: str, session: AsyncSession) ->
     fields = SiteCrawlPageDetail.model_fields
     known = {k: v for k, v in doc.items() if k in fields and k != "inlinks"}
     return SiteCrawlPageDetail(**known, inlinks=inlinks)
+
+
+async def get_site_crawl_templates(
+    crawl_id: str, session: AsyncSession
+) -> SiteCrawlTemplatesResponse:
+    """The per-template Lighthouse reports for one crawl.
+
+    Returns an empty list rather than a 404 when a crawl produced none: page
+    scoring and template measurement can both be switched off, and "we measured
+    nothing" is a legitimate answer about a crawl that otherwise succeeded.
+    """
+    row = await _require_crawl(crawl_id, session)
+    try:
+        docs = await site_pages.load_template_reports(crawl_id)
+    except PyMongoError as exc:
+        raise _mongo_503(exc) from exc
+    templates = [template_from_doc(doc) for doc in docs]
+    return SiteCrawlTemplatesResponse(
+        crawl_id=crawl_id,
+        host=row.host,
+        templates=templates,
+        found=row.templates_found or len(templates),
+        measured=row.templates_measured or sum(1 for t in templates if t.lighthouse),
+    )
+
+
+async def get_site_crawl_export(
+    crawl_id: str, session: AsyncSession, *, fmt: str, include_navigation: bool = False
+) -> tuple[AsyncIterator[bytes], str, str]:
+    """-> (byte stream, media type, filename) for a finished crawl.
+
+    Refused while a crawl is still running: an export of a half-finished crawl
+    looks identical to an export of a finished one, and nothing in the file would
+    say which it was.
+    """
+    row = await _require_crawl(crawl_id, session)
+    if row.status not in _TERMINAL:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This crawl is still {row.status}. Wait for it to finish before exporting.",
+        )
+    if fmt == "csv":
+        return (
+            site_crawl_export.stream_csv(row, include_navigation=include_navigation),
+            "text/csv; charset=utf-8",
+            site_crawl_export.export_filename(row, "csv"),
+        )
+    return (
+        site_crawl_export.stream_json(row, include_navigation=include_navigation),
+        "application/json; charset=utf-8",
+        site_crawl_export.export_filename(row, "json"),
+    )
 
 
 async def get_site_crawl_issues(crawl_id: str, session: AsyncSession) -> SiteCrawlIssuesResponse:

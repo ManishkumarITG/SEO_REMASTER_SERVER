@@ -99,9 +99,20 @@ def _stub_everything(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
         marked.append(list(urls))
         return len(urls)
 
+    async def build_template_reports(pages, **kwargs):
+        # The real one calls PageSpeed Insights, which is a 10-30s network round
+        # trip per template. No test may reach it.
+        return [{"template": "other", "page_count": len(pages), "representative_url": "",
+                 "median_words": 0, "sample_urls": [], "lighthouse": None, "error": ""}]
+
+    async def save_template_reports(crawl_id, records):
+        return len(records)
+
     monkeypatch.setattr(tasks, "probe_site", probe)
     monkeypatch.setattr(tasks, "save_pages", save_pages)
     monkeypatch.setattr(tasks, "mark_orphans", mark_orphans)
+    monkeypatch.setattr(tasks, "build_template_reports", build_template_reports)
+    monkeypatch.setattr(tasks, "save_template_reports", save_template_reports)
     _install_crawl(monkeypatch, [])
     saved.clear()
     return saved

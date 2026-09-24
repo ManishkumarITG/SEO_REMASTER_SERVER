@@ -45,6 +45,7 @@ from schemas.search_console import (
     StoredGscSitesResponse,
 )
 from schemas.site_crawl import (
+    LighthouseReport,
     SiteCrawlCreatedResponse,
     SiteCrawlCreateRequest,
     SiteCrawlIssue,
@@ -58,7 +59,10 @@ from schemas.site_crawl import (
     SiteCrawlStatus,
     SiteCrawlStatusResponse,
     SiteCrawlSummary,
+    SiteCrawlTemplate,
+    SiteCrawlTemplatesResponse,
     page_from_doc,
+    template_from_doc,
 )
 from schemas.stores import (
     StoreCatalogItem,
@@ -89,6 +93,7 @@ __all__ = [
     "GscSyncLogEntry",
     "GscSyncLogResponse",
     "HealthResponse",
+    "LighthouseReport",
     "LinkFlairOut",
     "PageMeta",
     "PrioritizedFix",
@@ -116,6 +121,8 @@ __all__ = [
     "SiteCrawlStatus",
     "SiteCrawlStatusResponse",
     "SiteCrawlSummary",
+    "SiteCrawlTemplate",
+    "SiteCrawlTemplatesResponse",
     "StoreCatalogItem",
     "StoreCatalogItemDetailResponse",
     "StoreCatalogItemKind",
@@ -140,4 +147,5 @@ __all__ = [
     "SubredditSummary",
     "SubredditsResponse",
     "page_from_doc",
+    "template_from_doc",
 ]

@@ -8,7 +8,8 @@ with the parameter.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from controller import site_crawl as site_crawl_controller
@@ -23,6 +24,7 @@ from schemas import (
     SiteCrawlPageSort,
     SiteCrawlPagesResponse,
     SiteCrawlStatusResponse,
+    SiteCrawlTemplatesResponse,
 )
 
 router = APIRouter(prefix="/api/site-crawls", tags=["site-crawls"])
@@ -105,6 +107,49 @@ async def get_site_crawl_page(
 ) -> SiteCrawlPageDetail:
     """One page with its outgoing links and the pages that link to it."""
     return await site_crawl_controller.get_site_crawl_page(crawl_id, url, session)
+
+
+@router.get("/{crawl_id}/templates", response_model=SiteCrawlTemplatesResponse)
+async def get_site_crawl_templates(
+    crawl_id: str, session: AsyncSession = Depends(get_session)
+) -> SiteCrawlTemplatesResponse:
+    """One Lighthouse report per template, measured on that template's median page.
+
+    A store has hundreds of product pages and one product template, so this is a
+    handful of records however large the crawl was.
+    """
+    return await site_crawl_controller.get_site_crawl_templates(crawl_id, session)
+
+
+@router.get("/{crawl_id}/export.{fmt}")
+async def export_site_crawl(
+    crawl_id: str,
+    fmt: str = Path(pattern="^(csv|json)$", description="csv or json"),
+    include_navigation: bool = Query(
+        default=False,
+        description="Also export pages fetched only to reach the ones that were asked for",
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    """Download the finished crawl as a file.
+
+    The file is built WHEN THIS IS CALLED and streamed straight out, never stored:
+    an export is something somebody asks for once, and pre-building one for every
+    crawl would keep megabytes nobody downloads.
+    """
+    stream, media_type, filename = await site_crawl_controller.get_site_crawl_export(
+        crawl_id, session, fmt=fmt, include_navigation=include_navigation
+    )
+    return StreamingResponse(
+        stream,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # The browser fetches this cross-origin, so the filename header has to
+            # be readable by the page that triggered the download.
+            "Access-Control-Expose-Headers": "Content-Disposition",
+        },
+    )
 
 
 @router.get("/{crawl_id}/issues", response_model=SiteCrawlIssuesResponse)

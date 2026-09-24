@@ -20,7 +20,7 @@ from sqlalchemy import or_, update
 
 from config import get_settings
 from db.session import async_session_factory
-from db.site_pages import mark_orphans, save_pages
+from db.site_pages import mark_orphans, save_pages, save_template_reports
 from db.store_catalog import save_catalog_enrichment, save_catalog_items
 from exceptions.crawler import FetchError
 from exceptions.stores import CatalogUnavailable, RobotsDisallowed
@@ -32,6 +32,11 @@ from services.crawler.models import CrawledPage, CrawlLimits, CrawlStats
 from services.crawler.site_crawl import crawl_site, probe_site
 from services.reports.scoring import build_report
 from services.site_crawl_analysis import bulk_analyzers, make_page_hook, parse_analyzer_names
+from services.site_crawl_templates import (
+    TEMPLATE_PHASE_TIMEOUT_S,
+    build_template_reports,
+    group_by_template,
+)
 from services.stores.discovery import discover_catalog, probe_store
 from services.stores.enrichment import BLOCKED_HOST_CONCURRENCY, HostGate, enrich_head_meta
 from services.stores.models import CatalogItem, EnrichmentStats
@@ -726,6 +731,8 @@ async def _finish_site_crawl(
     persistence_ok: bool,
     orphan_count: int,
     findings: dict[str, int],
+    templates_found: int = 0,
+    templates_measured: int = 0,
 ) -> None:
     async with async_session_factory() as session:
         await session.execute(
@@ -752,6 +759,8 @@ async def _finish_site_crawl(
                 skipped_page_type=stats.skipped_page_type,
                 throttled=stats.throttled,
                 gave_up_throttled=stats.gave_up_throttled,
+                templates_found=templates_found,
+                templates_measured=templates_measured,
                 pages_analyzed=stats.analyzed,
                 avg_score=stats.average_score,
                 critical_findings=stats.critical_findings,
@@ -772,6 +781,48 @@ async def _finish_site_crawl(
             )
         )
         await session.commit()
+
+
+#: Pages held for the template phase. Enough to group and pick a median
+#: representative for every template a store realistically has.
+TEMPLATE_SAMPLE_CAP = 600
+
+
+async def _run_template_phase(
+    crawl_id: str, pages: list[CrawledPage], settings: Any
+) -> tuple[int, int]:
+    """One Lighthouse report per template. -> (templates found, templates measured).
+
+    Runs AFTER the page walk, never during: PSI takes 10-30s a call and would
+    otherwise stall the crawl it is measuring. Everything here degrades to zero
+    reports rather than failing - the pages are already saved, and a crawl that
+    finished beats one that died reaching for a nice-to-have.
+    """
+    if not pages:
+        return 0, 0
+    found = len(group_by_template(pages))
+    if not getattr(settings, "site_crawl_template_lighthouse", False):
+        return found, 0
+    try:
+        records = await asyncio.wait_for(
+            build_template_reports(
+                pages,
+                strategy=getattr(settings, "site_crawl_lighthouse_strategy", "mobile"),
+                max_templates=getattr(settings, "site_crawl_max_templates", 8),
+            ),
+            TEMPLATE_PHASE_TIMEOUT_S,
+        )
+    except TimeoutError:
+        logger.warning("Site crawl %s: template phase timed out; pages are unaffected", crawl_id)
+        return found, 0
+    except Exception:  # noqa: BLE001 - a nice-to-have must never fail the crawl
+        logger.exception("Site crawl %s: template phase failed", crawl_id)
+        return found, 0
+
+    await save_template_reports(crawl_id, records)
+    measured = sum(1 for record in records if record.get("lighthouse"))
+    logger.info("Site crawl %s: %d template(s) found, %d measured", crawl_id, found, measured)
+    return found, measured
 
 
 async def _mark_site_crawl_failed(crawl_id: str, message: str) -> None:
@@ -810,6 +861,11 @@ async def run_site_crawl(crawl_id: str) -> None:
         #: edges: the edge count is pages x links, the URL count is the site.
         linked: set[str] = set()
         fetched_urls: list[str] = []
+        #: Pages kept in memory for the template phase, which needs to group them
+        #: and pick a representative. Capped: the phase wants a sample per
+        #: template, not the whole crawl, and 5,000 CrawledPage objects with their
+        #: text is not worth holding for a handful of Lighthouse runs.
+        template_sample: list[CrawledPage] = []
         findings = {"noindex": 0, "missing_title": 0, "missing_description": 0, "broken": 0}
         seed_url = requested_url
 
@@ -854,6 +910,8 @@ async def run_site_crawl(crawl_id: str) -> None:
                             findings["missing_title"] += 1
                         if page.ok and not page.meta_description:
                             findings["missing_description"] += 1
+                    if len(template_sample) < TEMPLATE_SAMPLE_CAP:
+                        template_sample.append(page)
                     progress.bump()
                     if len(buffer) >= SITE_FLUSH_EVERY_PAGES:
                         await flush_pages()
@@ -894,10 +952,15 @@ async def run_site_crawl(crawl_id: str) -> None:
         if orphans:
             await mark_orphans(crawl_id, orphans)
 
+        templates_found, templates_measured = await _run_template_phase(
+            crawl_id, template_sample, settings
+        )
+
         status = _site_terminal_status(stats)
         await _finish_site_crawl(
             crawl_id, stats=stats, status=status, persisted=persisted,
             persistence_ok=persistence_ok, orphan_count=len(orphans), findings=findings,
+            templates_found=templates_found, templates_measured=templates_measured,
         )
         logger.info(
             "Site crawl %s %s: %d target pages (%d navigation), avg score %s, %d orphans, %.1fs",

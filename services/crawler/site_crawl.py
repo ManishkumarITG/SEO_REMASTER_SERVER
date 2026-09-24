@@ -64,6 +64,7 @@ from services.crawler.http_client import (
 from services.crawler.models import CrawledPage, CrawlLimits, CrawlStats, SiteCrawlResult
 from services.crawler.parser import (
     PageData,
+    extract_main_text,
     first_attr,
     first_text,
     link_by_rel,
@@ -73,6 +74,7 @@ from services.crawler.parser import (
 )
 from services.crawler.robots import RobotsRules
 from services.crawler.sitemap import is_sitemap_url, looks_like_sitemap, parse_sitemap_locs
+from services.crawler.templates import detect_template
 from services.crawler.throttle import HostGate
 from services.crawler.urls import (
     classify_catalog_url,
@@ -119,6 +121,13 @@ MAX_SITEMAP_SEEDS = 25_000
 #: the finding is "robots blocks your search pages", not a list of them.
 MAX_SKIP_RECORDS = 200
 MAX_H1_KEPT = 5
+#: Headings kept per page, in document order. A broken template can emit hundreds;
+#: the outline is legible long before that and the finding ("this page has 240
+#: headings") survives in `heading_count`.
+MAX_HEADINGS_KEPT = 100
+#: Each heading's text, trimmed. A heading is a label, not a paragraph.
+MAX_HEADING_CHARS = 200
+_HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
 #: Ceiling on the set used to count depth-limited URLs once. Past it the counter
 #: may double-count a URL linked from several pages, which is a far better
 #: outcome than tracking a set the size of the site.
@@ -158,7 +167,45 @@ def robots_directives(dom: HTMLParser, headers: dict[str, str]) -> tuple[str, bo
     return raw, ("noindex" in tokens or "none" in tokens), ("nofollow" in tokens or "none" in tokens)
 
 
-def extract_page_facts(dom: HTMLParser, headers: dict[str, str] | None = None) -> dict[str, object]:
+def extract_headings(dom: HTMLParser) -> tuple[list[dict[str, object]], int, int]:
+    """The H1-H6 outline in document order. -> (headings, total, skipped levels).
+
+    Document order is the whole point: `h1_count` and `h2_count` say a page has
+    headings, but only the sequence shows that it jumps H1 -> H3, which is what
+    breaks the outline for screen readers and for the machines that read it as
+    document structure.
+
+    A "skip" is counted when a heading is more than one level deeper than the one
+    before it. Going back UP any number of levels is normal and not counted.
+    """
+    # NOT `dom.css("h1, h2, ...")`: selectolax evaluates a selector list per
+    # selector and returns the matches grouped by tag, so H1s arrive before every
+    # H2 regardless of where they sit. That reads as a tidy outline and is a lie -
+    # it would hide the very H1 -> H3 jump this function exists to find. Walking
+    # the tree is the only way to get document order.
+    root = dom.body if dom.body is not None else dom.root
+    nodes = [n for n in root.traverse() if n.tag in _HEADING_TAGS] if root is not None else []
+    headings: list[dict[str, object]] = []
+    skipped = 0
+    previous = 0
+    for node in nodes:
+        level = int(node.tag[1])
+        if previous and level > previous + 1:
+            skipped += 1
+        previous = level
+        if len(headings) < MAX_HEADINGS_KEPT:
+            text = " ".join((node.text() or "").split())[:MAX_HEADING_CHARS]
+            headings.append({"level": level, "text": text})
+    return headings, len(nodes), skipped
+
+
+def extract_page_facts(
+    dom: HTMLParser,
+    headers: dict[str, str] | None = None,
+    *,
+    url: str = "",
+    text_chars: int = 0,
+) -> dict[str, object]:
     """Reduce a parsed page to the facts a report needs, then let the markup go.
 
     Returns a plain dict rather than a model so `CrawledPage` stays the only
@@ -167,6 +214,7 @@ def extract_page_facts(dom: HTMLParser, headers: dict[str, str] | None = None) -
     raw_robots, noindex, nofollow = robots_directives(dom, headers or {})
     h1_nodes = dom.css("h1")
     images = dom.css("img")
+    headings, heading_count, heading_skips = extract_headings(dom)
     #: An absent alt and a whitespace-only alt are the same finding. A genuinely
     #: decorative image uses alt="" - which this counts too, on purpose: at crawl
     #: time we cannot tell decorative from forgotten, so we report and let the
@@ -186,6 +234,16 @@ def extract_page_facts(dom: HTMLParser, headers: dict[str, str] | None = None) -
         "word_count": len(visible_text(dom).split()),
         "images": len(images),
         "images_missing_alt": missing_alt,
+        # The full outline, not just the H1/H2 tallies above.
+        "headings": headings,
+        "heading_count": heading_count,
+        "heading_skips": heading_skips,
+        # Which template rendered this, so per-template work can group pages.
+        "template": detect_template(url, dom) if url else "",
+        # Main body text with nav/footer/header chrome stripped, capped. Empty
+        # when text storage is off: the markup itself is never kept, so this is
+        # the only record of what the page actually said.
+        "text_content": extract_main_text(dom, max_chars=text_chars) if text_chars > 0 else "",
     }
 
 
@@ -678,7 +736,10 @@ async def _fetch_page(
         return page
 
     dom = parse_html(result.text)
-    for key, value in extract_page_facts(dom, result.headers).items():
+    facts = extract_page_facts(
+        dom, result.headers, url=page.final_url or url, text_chars=limits.text_chars
+    )
+    for key, value in facts.items():
         setattr(page, key, value)
 
     if not same_site(page.final_url, host, include_subdomains=limits.include_subdomains):

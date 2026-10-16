@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import or_, update
 
 from config import get_settings
@@ -24,7 +25,7 @@ from db.site_pages import mark_orphans, save_pages, save_template_reports
 from db.store_catalog import save_catalog_enrichment, save_catalog_items
 from exceptions.crawler import FetchError
 from exceptions.stores import CatalogUnavailable, RobotsDisallowed
-from models.db import Audit, SiteCrawl, StoreCrawl
+from models.db import Audit, SiteAnalysis, SiteCrawl, StoreCrawl
 from services.analyzers.registry import get_analyzers
 from services.crawler.fetcher import fetch_page
 from services.crawler.http_client import crawl_client
@@ -1004,4 +1005,275 @@ async def reconcile_orphaned_site_crawls() -> int:
         return 0
     if count:
         logger.info("Marked %d site crawl(s) abandoned by a previous run as failed", count)
+    return count
+
+
+# --- Full store analysis ------------------------------------------------------------
+#
+# The pipeline that ties the tools together: spawn a normal site crawl, then read
+# Search Console and sample structured data on top of the pages it found. It adds
+# no crawler logic of its own - it schedules run_site_crawl and reuses that crawl's
+# pages, scores and per-template Lighthouse whole. The report and the CSV/JSON
+# exports are separate on-demand endpoints, not pipeline steps, so a Gemini call
+# only happens when the user asks for it.
+
+#: One analysis at a time. Each holds a crawl slot for its whole run while it waits
+#: on the spawned crawl, so stacking them would starve manual crawls.
+MAX_CONCURRENT_ANALYSES = 1
+_analysis_slot = asyncio.Semaphore(MAX_CONCURRENT_ANALYSES)
+
+_running_analyses: dict[str, asyncio.Task[None]] = {}
+_analysis_stop_requested: set[str] = set()
+
+#: Outer bound on waiting for the spawned crawl. The crawl has its own deadline;
+#: this stops a wedged crawl hanging the analysis forever.
+ANALYSIS_CRAWL_WAIT_S = 35 * 60
+_NON_TERMINAL_ANALYSIS = ("pending", "running")
+#: An analysis silent this long is presumed dead - see the SiteCrawl heartbeat note.
+ANALYSIS_STALE_AFTER_S = 300
+
+
+def schedule_site_analysis(analysis_id: str) -> None:
+    """Start an analysis detached from the request, as site crawls are scheduled."""
+    if analysis_id in _running_analyses:
+        return
+    task = asyncio.create_task(run_site_analysis(analysis_id), name=f"analysis:{analysis_id}")
+    _running_analyses[analysis_id] = task
+
+    def _done(finished: asyncio.Task[None]) -> None:
+        _running_analyses.pop(analysis_id, None)
+        _analysis_stop_requested.discard(analysis_id)
+        if not finished.cancelled() and finished.exception() is not None:
+            logger.error("Analysis %s task raised", analysis_id, exc_info=finished.exception())
+
+    task.add_done_callback(_done)
+
+
+def request_site_analysis_stop(analysis_id: str) -> bool:
+    """Ask a running analysis to stop; also stops its spawned crawl. True if running."""
+    if analysis_id not in _running_analyses:
+        return False
+    _analysis_stop_requested.add(analysis_id)
+    return True
+
+
+def site_analysis_is_running(analysis_id: str) -> bool:
+    return analysis_id in _running_analyses
+
+
+async def wait_for_site_analysis(analysis_id: str) -> None:
+    """Await a scheduled analysis if it runs in this process. For tests and shutdown."""
+    task = _running_analyses.get(analysis_id)
+    if task is not None:
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _analysis_heartbeat(analysis_id: str, *, phase: str, **values: Any) -> None:
+    async with async_session_factory() as session:
+        await session.execute(
+            update(SiteAnalysis)
+            .where(SiteAnalysis.id == analysis_id)
+            .values(phase=phase, heartbeat_at=datetime.now(UTC), **values)
+        )
+        await session.commit()
+
+
+async def _spawn_crawl(
+    analysis_id: str, start_url: str, options: dict[str, Any], user_id: str | None
+) -> str | None:
+    """Create and schedule the analysis crawl via the ordinary crawl path. -> crawl_id."""
+    from schemas import SiteCrawlCreateRequest
+    from services import site_crawl_service
+
+    # Only the fields SiteCrawlCreateRequest accepts; the analysis may store extras.
+    allowed = {"max_pages", "max_depth", "include_subdomains", "follow_nofollow",
+               "seed_from_sitemap", "page_types", "max_navigation_pages"}
+    payload = SiteCrawlCreateRequest(
+        start_url=start_url, **{k: v for k, v in options.items() if k in allowed}
+    )
+    try:
+        async with async_session_factory() as session:
+            created = await site_crawl_service.create_site_crawl(
+                payload, BackgroundTasks(), session, user_id
+            )
+    except HTTPException as exc:
+        logger.warning("Analysis %s: crawl could not start: %s", analysis_id, exc.detail)
+        return None
+    return created.crawl_id
+
+
+#: How often the stop watcher looks for a stop request while the crawl runs.
+_STOP_WATCH_INTERVAL_S = 1.0
+
+
+async def _forward_stop_to_crawl(should_stop: Callable[[], bool], crawl_id: str) -> None:
+    """Forward the analysis's stop request to its crawl as soon as it is made.
+
+    Runs beside `_await_crawl`, which cannot check the flag itself while it is
+    blocked on the crawl task. Cancelled by the caller once the crawl is over.
+    """
+    while not should_stop():
+        await asyncio.sleep(_STOP_WATCH_INTERVAL_S)
+    request_site_crawl_stop(crawl_id)
+
+
+async def _await_crawl(crawl_id: str) -> SiteCrawl | None:
+    """Wait for the spawned crawl to reach a terminal status. Returns the row."""
+    await wait_for_site_crawl(crawl_id)  # fast path when the crawl runs in this process
+    deadline = time.monotonic() + ANALYSIS_CRAWL_WAIT_S
+    terminal = ("complete", "partial", "failed", "stopped")
+    while time.monotonic() < deadline:
+        async with async_session_factory() as session:
+            row = await session.get(SiteCrawl, crawl_id)
+        if row is None or row.status in terminal:
+            return row
+        await asyncio.sleep(3)
+    async with async_session_factory() as session:
+        return await session.get(SiteCrawl, crawl_id)
+
+
+async def _load_crawl_pages(crawl_id: str) -> list[dict[str, Any]]:
+    """The crawl pages as plain dicts, for GSC sampling and schema sampling."""
+    from db.mongo import get_db
+
+    cursor = get_db()["site_crawl_pages"].find(
+        {"crawl_id": crawl_id},
+        {"_id": 0, "url": 1, "final_url": 1, "template": 1, "status_code": 1,
+         "skipped": 1, "error": 1, "is_target": 1},
+    )
+    return await cursor.to_list(20_000)
+
+
+async def _mark_analysis_failed(analysis_id: str, message: str) -> None:
+    try:
+        async with async_session_factory() as session:
+            await session.execute(
+                update(SiteAnalysis).where(SiteAnalysis.id == analysis_id)
+                .values(status="failed", phase="done", error_message=message,
+                        completed_at=datetime.now(UTC))
+            )
+            await session.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("Analysis %s: could not record the failure", analysis_id)
+
+
+async def run_site_analysis(analysis_id: str) -> None:
+    """Crawl the site, then layer Search Console and schema findings on top."""
+    async with _analysis_slot:
+        async with async_session_factory() as session:
+            row = await session.get(SiteAnalysis, analysis_id)
+            if row is None:
+                logger.error("Analysis %s not found", analysis_id)
+                return
+            start_url, options, user_id = row.start_url, dict(row.options or {}), row.user_id
+            row.status = "running"
+            row.phase = "crawl"
+            row.started_at = datetime.now(UTC)
+            row.heartbeat_at = row.started_at
+            await session.commit()
+
+        def stopped() -> bool:
+            return analysis_id in _analysis_stop_requested
+
+        # --- phase 1: crawl -------------------------------------------------------
+        crawl_id = await _spawn_crawl(analysis_id, start_url, options, user_id)
+        if crawl_id is None:
+            await _mark_analysis_failed(
+                analysis_id, "The site could not be crawled (unreachable or disallowed)."
+            )
+            return
+        await _analysis_heartbeat(analysis_id, phase="crawl", crawl_id=crawl_id)
+
+        if stopped():
+            request_site_crawl_stop(crawl_id)
+        # A stop can also arrive while the crawl is running. `_await_crawl` blocks on
+        # the crawl task, so a side watcher forwards the request the moment it lands
+        # rather than after the crawl has finished on its own.
+        watcher = asyncio.create_task(_forward_stop_to_crawl(stopped, crawl_id))
+        try:
+            crawl = await _await_crawl(crawl_id)
+        finally:
+            watcher.cancel()
+        if crawl is None or crawl.pages_fetched == 0:
+            await _mark_analysis_failed(analysis_id, "The crawl fetched no pages.")
+            return
+
+        pages = await _load_crawl_pages(crawl_id)
+        notes: list[str] = []
+
+        # --- phase 2: Search Console (performance + sampled inspection) -----------
+        await _analysis_heartbeat(
+            analysis_id, phase="gsc", pages_fetched=crawl.pages_fetched, avg_score=crawl.avg_score
+        )
+        from services.site_analysis_gsc import collect_gsc
+
+        gsc = await collect_gsc(user_id, crawl.host, pages)
+        if gsc.error:
+            notes.append(f"Search Console: {gsc.error}")
+
+        # --- phase 3: sampled structured data ------------------------------------
+        await _analysis_heartbeat(analysis_id, phase="schema")
+        from services.site_analysis_schema import sample_schema
+
+        settings = get_settings()
+        schema = await sample_schema(pages, user_agent=settings.crawler_user_agent)
+
+        # --- finish ---------------------------------------------------------------
+        status = (
+            "stopped" if stopped()
+            else ("partial" if crawl.status in ("partial", "stopped") else "complete")
+        )
+        schema_gap = sum((schema.get("product_field_gaps") or {}).values())
+        async with async_session_factory() as session:
+            await session.execute(
+                update(SiteAnalysis).where(SiteAnalysis.id == analysis_id).values(
+                    status=status,
+                    phase="done",
+                    site_name=crawl.site_name,
+                    pages_fetched=crawl.pages_fetched,
+                    avg_score=crawl.avg_score,
+                    templates_measured=crawl.templates_measured or 0,
+                    gsc_connected=gsc.connected,
+                    gsc_site_url=gsc.site_url or None,
+                    gsc_error=gsc.error or None,
+                    indexed_count=gsc.indexed_count,
+                    not_indexed_count=gsc.not_indexed_count,
+                    schema_gap_count=schema_gap,
+                    result_json={"gsc": gsc.as_dict(), "schema": schema},
+                    notes=notes,
+                    heartbeat_at=datetime.now(UTC),
+                    completed_at=datetime.now(UTC),
+                )
+            )
+            await session.commit()
+        logger.info(
+            "Analysis %s %s: %d pages, gsc=%s, schema sampled=%s",
+            analysis_id, status, crawl.pages_fetched, gsc.connected, schema.get("sampled", 0),
+        )
+
+
+async def reconcile_orphaned_analyses() -> int:
+    """Fail analyses whose worker went silent, at startup. Mirrors the crawl reaper."""
+    from datetime import timedelta
+
+    cutoff = datetime.now(UTC) - timedelta(seconds=ANALYSIS_STALE_AFTER_S)
+    try:
+        async with async_session_factory() as session:
+            result = await session.execute(
+                update(SiteAnalysis)
+                .where(
+                    SiteAnalysis.status.in_(_NON_TERMINAL_ANALYSIS),
+                    or_(SiteAnalysis.heartbeat_at.is_(None), SiteAnalysis.heartbeat_at < cutoff),
+                )
+                .values(status="failed", phase="done",
+                        error_message="The server restarted before this analysis finished.",
+                        completed_at=datetime.now(UTC))
+            )
+            await session.commit()
+            count = result.rowcount or 0
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not reconcile orphaned analyses")
+        return 0
+    if count:
+        logger.info("Marked %d analysis(es) abandoned by a previous run as failed", count)
     return count

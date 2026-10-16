@@ -31,6 +31,7 @@ from schemas.backlinks import (
     SubredditSummary,
 )
 from schemas.health import HealthResponse
+from schemas.report import ReportEngine
 from schemas.search_console import (
     ConnectionStatus,
     GoogleSite,
@@ -43,6 +44,13 @@ from schemas.search_console import (
     StoredAnalyticsRow,
     StoredGscSite,
     StoredGscSitesResponse,
+)
+from schemas.site_analysis import (
+    SiteAnalysisCreatedResponse,
+    SiteAnalysisCreateRequest,
+    SiteAnalysisListResponse,
+    SiteAnalysisStatusResponse,
+    SiteAnalysisSummary,
 )
 from schemas.site_crawl import (
     LighthouseReport,
@@ -106,8 +114,14 @@ __all__ = [
     "RedditPostSummary",
     "RedditPostsResponse",
     "RedditPublishRequest",
+    "ReportEngine",
     "SearchAnalyticsResponse",
     "SearchAnalyticsRow",
+    "SiteAnalysisCreateRequest",
+    "SiteAnalysisCreatedResponse",
+    "SiteAnalysisListResponse",
+    "SiteAnalysisStatusResponse",
+    "SiteAnalysisSummary",
     "SiteCrawlCreateRequest",
     "SiteCrawlCreatedResponse",
     "SiteCrawlIssue",

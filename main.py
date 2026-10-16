@@ -26,6 +26,7 @@ from db.session import init_db
 from middleware import register_middleware
 from routes import register_routes
 from workers.tasks import (
+    reconcile_orphaned_analyses,
     reconcile_orphaned_audits,
     reconcile_orphaned_crawls,
     reconcile_orphaned_site_crawls,
@@ -61,6 +62,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await reconcile_orphaned_audits()
     await reconcile_orphaned_crawls()
     await reconcile_orphaned_site_crawls()
+    await reconcile_orphaned_analyses()
     yield
     await close_mongo_client()
 

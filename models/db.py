@@ -307,3 +307,61 @@ class SiteCrawl(Base):
     #: heartbeat has gone quiet.
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SiteAnalysis(Base):
+    """One full-store analysis: the pipeline that orchestrates crawl + GSC + report.
+
+    A thin coordinator row. It spawns a normal SiteCrawl (referenced by
+    `crawl_id`) and reuses that crawl's pages, scores and per-template Lighthouse
+    wholesale rather than re-doing any of it. What it adds - the Search Console
+    read and the sampled schema check - is small and lives in `result_json`; the
+    heavy page data stays in the crawl's MongoDB collection.
+
+    A new table, so NOT NULL defaults are fine (create_all builds it whole); the
+    nullable-column rule only bites columns ADDED to a table that already exists.
+    """
+
+    __tablename__ = "site_analyses"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    start_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    host: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    site_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    #: Session user, when known. Nullable and not a foreign key, as on Audit.user_id.
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    #: pending | running | complete | partial | failed | stopped
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    #: The step currently running, for the progress UI: crawl | gsc | report | done.
+    phase: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+
+    #: The crawl this analysis spawned; its pages/scores/templates are reused whole.
+    crawl_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+
+    # --- Search Console outcome (best-effort) ------------------------------------------
+    gsc_connected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    gsc_site_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    gsc_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # --- headline roll-ups, for the list/summary without opening result_json -----------
+    pages_fetched: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    avg_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    indexed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    not_indexed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    schema_gap_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    templates_measured: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    #: The crawl options this analysis was asked for, so the worker rebuilds the
+    #: same limits and a report can state what was requested.
+    options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    #: The GSC read and the sampled schema aggregate. The crawl's own data lives in
+    #: MongoDB; this holds only what the pipeline adds on top.
+    result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    notes: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: Last sign of life from the worker; startup reconciliation only reaps stale rows.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

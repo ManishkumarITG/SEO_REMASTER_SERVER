@@ -19,6 +19,7 @@ from routes import (
     health,
     reddit_auth,
     search_console,
+    site_analysis,
     site_crawl,
     stores,
 )
@@ -33,6 +34,7 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(backlinks.router)
     app.include_router(stores.router)
     app.include_router(site_crawl.router)
+    app.include_router(site_analysis.router)
 
 
 __all__ = [
@@ -43,6 +45,7 @@ __all__ = [
     "reddit_auth",
     "register_routes",
     "search_console",
+    "site_analysis",
     "site_crawl",
     "stores",
 ]

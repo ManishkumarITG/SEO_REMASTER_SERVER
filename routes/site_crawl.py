@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from controller import site_crawl as site_crawl_controller
 from db.session import get_session
 from schemas import (
+    ReportEngine,
     SiteCrawlCreatedResponse,
     SiteCrawlCreateRequest,
     SiteCrawlIssue,
@@ -111,14 +112,25 @@ async def get_site_crawl_page(
 
 @router.get("/{crawl_id}/report.html")
 async def generate_site_crawl_report(
-    crawl_id: str, session: AsyncSession = Depends(get_session)
+    crawl_id: str,
+    engine: ReportEngine = Query(
+        default="gemini",
+        description=(
+            "Who writes it: `gemini` (hosted), `ollama` (the local model server) or "
+            "`claude` (the Claude Code CLI logged in on the server)"
+        ),
+    ),
+    session: AsyncSession = Depends(get_session),
 ) -> Response:
     """Generate an AI SEO audit report and download it as a standalone HTML file.
 
-    The report is built WHEN THIS IS CALLED: Gemini reads the crawl's real figures
-    and writes the analysis, which takes a few seconds. Nothing is stored.
+    The report is built WHEN THIS IS CALLED: the chosen engine reads the crawl's
+    real figures and writes the analysis. Gemini takes seconds; a local Ollama
+    model can take minutes. Nothing is stored.
     """
-    document, filename = await site_crawl_controller.generate_site_crawl_report(crawl_id, session)
+    document, filename = await site_crawl_controller.generate_site_crawl_report(
+        crawl_id, session, engine=engine
+    )
     return Response(
         content=document,
         media_type="text/html; charset=utf-8",

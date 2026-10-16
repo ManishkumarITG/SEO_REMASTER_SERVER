@@ -580,7 +580,7 @@ async def test_the_report_endpoint_downloads_a_named_html_file(
 ) -> None:
     row = await _seed_row(status="complete", host="shop.example.com", pages_fetched=3)
 
-    async def fake_generate(crawl_id, session):
+    async def fake_generate(crawl_id, session, *, engine="gemini"):
         assert crawl_id == row.id
         return b"<!doctype html><html><body>report</body></html>", "sitecrawl-shop.example.com-report.html"
 
@@ -606,7 +606,7 @@ async def test_report_without_gemini_configured_is_503(monkeypatch: pytest.Monke
 
     row = await _seed_row(status="complete", pages_fetched=1)
 
-    async def unconfigured(r):
+    async def unconfigured(r, *, engine="gemini"):
         raise GeminiNotConfigured("no key")
 
     async def payload(r):
@@ -625,7 +625,7 @@ async def test_report_when_gemini_fails_is_502(monkeypatch: pytest.MonkeyPatch) 
 
     row = await _seed_row(status="complete", pages_fetched=1)
 
-    async def failing(r):
+    async def failing(r, *, engine="gemini"):
         raise GeminiError("upstream boom")
 
     monkeypatch.setattr(report_mod, "generate_report_html", failing)
@@ -636,3 +636,120 @@ async def test_report_when_gemini_fails_is_502(monkeypatch: pytest.MonkeyPatch) 
 
 async def test_report_for_an_unknown_crawl_is_404() -> None:
     assert _client().get(f"/api/site-crawls/{uuid4()}/report.html").status_code == 404
+
+
+# --- the engine switch: ?engine=ollama --------------------------------------------------
+
+
+async def test_report_engine_ollama_is_forwarded_to_the_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+    seen: list[str] = []
+
+    async def fake(r, *, engine="gemini"):
+        seen.append(engine)
+        return b"<!doctype html><html><body>local</body></html>", "sitecrawl-x-ollama-report.html"
+
+    monkeypatch.setattr(report_mod, "generate_report_html", fake)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html?engine=ollama")
+    assert response.status_code == 200
+    assert seen == ["ollama"]
+    assert "ollama-report.html" in response.headers["content-disposition"]
+
+
+async def test_report_engine_defaults_to_gemini(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+    seen: list[str] = []
+
+    async def fake(r, *, engine="gemini"):
+        seen.append(engine)
+        return b"<!doctype html><html></html>", "sitecrawl-x-report.html"
+
+    monkeypatch.setattr(report_mod, "generate_report_html", fake)
+    assert _client().get(f"/api/site-crawls/{row.id}/report.html").status_code == 200
+    assert seen == ["gemini"]
+
+
+def test_an_unknown_report_engine_is_422() -> None:
+    response = _client().get(f"/api/site-crawls/{uuid4()}/report.html?engine=chatgpt")
+    assert response.status_code == 422
+
+
+async def test_report_when_ollama_is_down_is_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+    from exceptions.ollama import OllamaError
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+
+    async def failing(r, *, engine="gemini"):
+        raise OllamaError("Ollama is not reachable at http://localhost:11434 - is `ollama serve` running?")
+
+    monkeypatch.setattr(report_mod, "generate_report_html", failing)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html?engine=ollama")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail.startswith("Ollama") and "not reachable" in detail
+
+
+async def test_report_without_ollama_configured_is_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+    from exceptions.ollama import OllamaNotConfigured
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+
+    async def unconfigured(r, *, engine="gemini"):
+        raise OllamaNotConfigured("no url")
+
+    monkeypatch.setattr(report_mod, "generate_report_html", unconfigured)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html?engine=ollama")
+    assert response.status_code == 503
+    assert "OLLAMA_BASE_URL" in response.json()["detail"]
+
+
+async def test_report_engine_claude_is_accepted_and_forwarded(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+    seen: list[str] = []
+
+    async def fake(r, *, engine="gemini"):
+        seen.append(engine)
+        return b"<!doctype html><html><body>claude</body></html>", "sitecrawl-x-claude-report.html"
+
+    monkeypatch.setattr(report_mod, "generate_report_html", fake)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html?engine=claude")
+    assert response.status_code == 200 and seen == ["claude"]
+
+
+async def test_report_when_the_claude_cli_fails_is_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+    from exceptions.claude_cli import ClaudeCliError
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+
+    async def failing(r, *, engine="gemini"):
+        raise ClaudeCliError("Claude CLI reported an error: usage limit reached")
+
+    monkeypatch.setattr(report_mod, "generate_report_html", failing)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html?engine=claude")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail.startswith("Claude (") and "usage limit" in detail
+
+
+async def test_report_without_the_claude_cli_installed_is_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    import services.site_crawl_report as report_mod
+    from exceptions.claude_cli import ClaudeCliNotConfigured
+
+    row = await _seed_row(status="complete", pages_fetched=1)
+
+    async def unconfigured(r, *, engine="gemini"):
+        raise ClaudeCliNotConfigured("not found")
+
+    monkeypatch.setattr(report_mod, "generate_report_html", unconfigured)
+    response = _client().get(f"/api/site-crawls/{row.id}/report.html?engine=claude")
+    assert response.status_code == 503
+    assert "Claude Code CLI" in response.json()["detail"]

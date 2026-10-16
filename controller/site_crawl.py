@@ -8,6 +8,7 @@ from fastapi import BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from schemas import (
+    ReportEngine,
     SiteCrawlCreatedResponse,
     SiteCrawlCreateRequest,
     SiteCrawlIssuesResponse,
@@ -81,5 +82,7 @@ async def get_site_crawl_export(
     )
 
 
-async def generate_site_crawl_report(crawl_id: str, session: AsyncSession) -> tuple[bytes, str]:
-    return await site_crawl_service.generate_site_crawl_report(crawl_id, session)
+async def generate_site_crawl_report(
+    crawl_id: str, session: AsyncSession, *, engine: ReportEngine
+) -> tuple[bytes, str]:
+    return await site_crawl_service.generate_site_crawl_report(crawl_id, session, engine=engine)

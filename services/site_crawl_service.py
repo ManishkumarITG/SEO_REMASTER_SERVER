@@ -31,7 +31,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import get_settings
 from db import site_pages
 from exceptions.crawler import FetchError
-from exceptions.gemini import GeminiError, GeminiNotConfigured
 from exceptions.stores import RobotsDisallowed
 from models.db import SiteCrawl
 from schemas import (
@@ -47,11 +46,13 @@ from schemas import (
     page_from_doc,
     template_from_doc,
 )
+from schemas.report import ReportEngine
 from services import site_crawl_export, site_crawl_report
 from services.crawler.http_client import crawl_client
 from services.crawler.models import CrawlLimits
 from services.crawler.site_crawl import probe_site
 from services.crawler.urls import host_of
+from services.report_engines import report_errors_as_http
 from services.reports.scoring import grade_for
 from workers.tasks import (
     SITE_CRAWL_STALE_AFTER_S,
@@ -439,12 +440,14 @@ async def get_site_crawl_export(
     )
 
 
-async def generate_site_crawl_report(crawl_id: str, session: AsyncSession) -> tuple[bytes, str]:
-    """-> (HTML bytes, filename) for a Gemini-written audit report.
+async def generate_site_crawl_report(
+    crawl_id: str, session: AsyncSession, *, engine: ReportEngine = "gemini"
+) -> tuple[bytes, str]:
+    """-> (HTML bytes, filename) for an AI-written audit report.
 
-    503 when Gemini is not configured, 409 when the crawl is not finished, 502
-    when Gemini itself fails - the report is generated live, so a model outage is
-    a gateway failure, not ours.
+    503 when the chosen engine is not configured, 409 when the crawl is not
+    finished, 502 when the engine itself fails - the report is generated live,
+    so a model outage is a gateway failure, not ours.
     """
     row = await _require_crawl(crawl_id, session)
     if row.status not in _TERMINAL:
@@ -452,16 +455,8 @@ async def generate_site_crawl_report(crawl_id: str, session: AsyncSession) -> tu
             status_code=409,
             detail=f"This crawl is still {row.status}. Wait for it to finish before generating a report.",
         )
-    try:
-        return await site_crawl_report.generate_report_html(row)
-    except GeminiNotConfigured as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Report generation is unavailable: GEMINI_API_KEY is not set.",
-        ) from exc
-    except GeminiError as exc:
-        # The gateway already stripped anything sensitive from the message.
-        raise HTTPException(status_code=502, detail=f"Gemini could not generate the report: {exc}") from exc
+    with report_errors_as_http(engine):
+        return await site_crawl_report.generate_report_html(row, engine=engine)
 
 
 async def get_site_crawl_issues(crawl_id: str, session: AsyncSession) -> SiteCrawlIssuesResponse:

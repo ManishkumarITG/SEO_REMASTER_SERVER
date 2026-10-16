@@ -1,33 +1,36 @@
 # The crawler
 
-How the site-wide crawler behaves, what bounds it, and where each decision lives
-in the code. Written against the code, not from memory: every number below is the
-value in the source at the time of writing, and each one is named so you can grep
-for it rather than trust this file.
+Site-wide crawler kaise behave karta hai, use kya cheezein bound karti hain, aur har
+decision code mein kahan rehta hai. Ye document code ke against likha gaya hai,
+yaad se nahi: neeche ka har number likhte waqt source mein jo value thi wahi hai,
+aur har ek ka naam diya gaya hai taaki aap is file par bharosa karne ke bajaye use
+grep kar sakein.
+
+(English original: `server/docs/en/crawler.md`)
 
 ---
 
-## 1. Three crawl shapes, deliberately separate
+## 1. Teen crawl shapes, jaan-boojh kar alag rakhe gaye
 
-The service layer contains three different things that all "crawl", and they are
-not variants of each other. Knowing which one you are looking at prevents most
-confusion.
+Service layer mein teen alag cheezein hain jo sab "crawl" karti hain, aur ye ek
+doosre ke variants nahi hain. Aap kaunsi wali dekh rahe hain ye jaanna hi zyadatar
+confusion rok deta hai.
 
-| Shape | Entry point | What it walks | Frontier |
+| Shape | Entry point | Kya walk karta hai | Frontier |
 |---|---|---|---|
-| Single page | `services/crawler/fetcher.py::fetch_page` | One URL the user typed | None |
-| Store catalog | `services/stores/` | A Shopify catalog, from `products.json` or a sitemap | Known up front |
-| **Site-wide** | `services/crawler/site_crawl.py::crawl_site` | A whole site, following links | **Grows as it runs** |
+| Single page | `services/crawler/fetcher.py::fetch_page` | Ek URL jo user ne type kiya | Koi nahi |
+| Store catalog | `services/stores/` | Ek Shopify catalog, `products.json` ya sitemap se | Pehle se pata |
+| **Site-wide** | `services/crawler/site_crawl.py::crawl_site` | Poori site, links follow karte hue | **Chalte-chalte badhta hai** |
 
-This document is about the third. The growing frontier is what makes it a
-different problem: workers must block waiting for URLs that other workers have
-not produced yet, and the crawl is finished only when the frontier is empty *and*
-no worker is mid-page. That is `asyncio.Queue.join()`, which is why the site
-crawl uses a queue with `task_done()` rather than the fixed worker-pool-plus-
-sentinels pattern in `services/stores/enrichment.py`.
+Ye document teesre wale ke baare mein hai. Badhta hua frontier hi ise ek alag
+problem banata hai: workers ko un URLs ka wait karna padta hai jo doosre workers ne
+abhi produce hi nahi kiye, aur crawl tabhi khatam hota hai jab frontier khaali ho
+*aur* koi worker page ke beech mein na ho. Yahi `asyncio.Queue.join()` hai, isliye
+site crawl `task_done()` wali queue use karta hai, na ki
+`services/stores/enrichment.py` wala fixed worker-pool-plus-sentinels pattern.
 
-Everything below the crawl shape is shared on purpose, so a fix to politeness
-lands everywhere at once:
+Crawl shape ke neeche ki har cheez jaan-boojh kar shared hai, taaki politeness ka
+ek fix ek saath sab jagah lage:
 
 ```
 services/crawler/
@@ -44,7 +47,7 @@ services/crawler/
 
 ---
 
-## 2. The request lifecycle
+## 2. Request ka lifecycle
 
 ```
 POST /api/site-crawls
@@ -72,352 +75,363 @@ GET /api/site-crawls/{id}/page     one page, with inlinks and outlinks
 POST /api/site-crawls/{id}/stop    ask it to finish now
 ```
 
-**The task is not a FastAPI `BackgroundTask`.** Those run inside the response and
-are cancelled when the client connection goes away, which silently truncated long
-crawls. `schedule_site_crawl` uses `asyncio.create_task` and holds a strong
-reference in `_running_site_crawls`, because asyncio only keeps a weak one and a
-crawl could otherwise be garbage collected mid-run.
+**Ye task FastAPI ka `BackgroundTask` nahi hai.** Wo response ke andar chalte hain
+aur client connection jaate hi cancel ho jaate hain, jisse lambe crawls chupchaap
+truncate ho jaate the. `schedule_site_crawl` `asyncio.create_task` use karta hai
+aur `_running_site_crawls` mein ek strong reference rakhta hai, kyunki asyncio sirf
+weak reference rakhta hai aur warna ek crawl beech run mein garbage collect ho
+sakta tha.
 
 ---
 
-## 3. What bounds a crawl
+## 3. Crawl ko kya bound karta hai
 
-Every exit is explicit and recorded in `CrawlStats`. Reaching one is a normal
-outcome, never an exception: a partial crawl with an honest reason is worth more
-than a raised error.
+Har exit explicit hai aur `CrawlStats` mein record hota hai. Kisi bound tak
+pahunchna ek normal outcome hai, exception kabhi nahi: imaandaar reason ke saath
+ek partial crawl, raised error se zyada kaam ka hai.
 
-| Bound | Default | Setting / field | Recorded as |
+| Bound | Default | Setting / field | Kis naam se record hota hai |
 |---|---|---|---|
-| Pages fetched | 500 | `SITE_CRAWL_MAX_PAGES`, `CrawlLimits.max_pages` | `hit_page_budget` |
-| Link depth from the seed | 5 | `SITE_CRAWL_MAX_DEPTH` | `beyond_depth` |
+| Fetch kiye gaye pages | 500 | `SITE_CRAWL_MAX_PAGES`, `CrawlLimits.max_pages` | `hit_page_budget` |
+| Seed se link depth | 5 | `SITE_CRAWL_MAX_DEPTH` | `beyond_depth` |
 | Wall clock | 1800s | `SITE_CRAWL_DEADLINE_S` | `deadline_hit` |
 | Navigation detour | 100 pages | `CrawlLimits.max_navigation_pages` | `hit_navigation_budget` |
-| Bytes per page | 2 MiB | `MAX_PAGE_BYTES` | `truncated` on the page |
-| A person pressing Stop | — | `POST .../stop` | `stopped_by_user` |
+| Bytes per page | 2 MiB | `MAX_PAGE_BYTES` | page par `truncated` |
+| Koi insaan Stop dabaye | — | `POST .../stop` | `stopped_by_user` |
 
-**`max_pages = 0` means no page limit.** Zero is the only special value; every
-other number is a literal ceiling, and a negative is floored to zero rather than
-becoming unlimited by accident. With no page limit the deadline and the depth
-limit are the only bounds left, which is why neither can be switched off from the
-API. `CrawlLimits.page_budget` returns `None` for the unlimited case so callers
-cannot accidentally compare against `0`.
+**`max_pages = 0` ka matlab hai koi page limit nahi.** Zero hi ek-matr special
+value hai; baaki har number ek literal ceiling hai, aur negative value galti se
+unlimited banne ke bajaye zero par floor ho jaati hai. Bina page limit ke sirf
+deadline aur depth limit bache rehte hain, isliye in dono ko API se off nahi kiya
+ja sakta. Unlimited case ke liye `CrawlLimits.page_budget` `None` return karta hai
+taaki callers galti se `0` ke against compare na kar sakein.
 
-Requests are additionally capped at the edge, in `schemas/site_crawl.py`:
-`MAX_REQUESTABLE_PAGES = 5000`, `MAX_REQUESTABLE_DEPTH = 10`. Those numbers
-decide how much traffic we send to somebody else, so they are rejected with a 422
-rather than clamped silently three layers in.
+Requests ko edge par bhi cap kiya jaata hai, `schemas/site_crawl.py` mein:
+`MAX_REQUESTABLE_PAGES = 5000`, `MAX_REQUESTABLE_DEPTH = 10`. Ye numbers tay karte
+hain ki hum kisi aur ko kitna traffic bhejenge, isliye inhe teen layer andar
+chupchaap clamp karne ke bajaye 422 ke saath reject kiya jaata hai.
 
-**Rate limiting is NOT a bound.** See section 5.
+**Rate limiting koi bound NAHI hai.** Section 5 dekhein.
 
 ---
 
 ## 4. Politeness
 
-The crawl makes hundreds of unattended requests to a third party. Every control
-here exists because ignoring it is how an IP ends up on a block list.
+Crawl ek third party ko sainkdon unattended requests bhejta hai. Yahan ka har
+control isliye hai kyunki use ignore karne se hi ek IP block list par pahunchta hai.
 
-- **Identity.** `SEOAnalyzerBot/0.1 (+https://github.com/seo-remaster/bot)`. An
-  honest bot UA with a contact URL, never a spoofed browser. Several stores
-  throttle named SEO bots specifically; impersonating a browser to dodge that is
-  a terms breach.
-- **robots.txt** is fetched once per crawl and honoured, including wildcards and
-  `$` anchors (`robots.py::path_allowed`, longest match wins, `Allow` beats
-  `Disallow` on a tie). A group naming our own token beats `*`. A blanket
-  `Disallow: /` is refused at the POST with a 403.
-- **The matched path includes the query string** (`robots_target`). Shopify ships
-  `Disallow: /*?*oseid=*`, and matching the bare path would allow every URL such
-  a rule exists to exclude.
-- **`Crawl-delay`** is used as the floor between requests, clamped to 2s so a
-  hostile value cannot stall a job for hours.
-- **`HostGate`** serialises request *starts* rather than whole requests, so the
-  rate ceiling holds while `concurrency` workers stay in flight. Default floor
-  for a site crawl is 0.1s; the catalog crawl uses 0.06s because a `<head>` read
-  is lighter than a whole page.
-- **SSRF.** The seed host is checked with `is_public_host` (rejects loopback,
-  private, link-local, reserved, multicast). Every URL entering the frontier must
-  be same-site, so a document the target controls cannot aim the crawler at a new
-  host. httpx still follows redirects anywhere, so the same-site rule is
-  re-applied to the *final* URL before its links are followed.
+- **Identity.** `SEOAnalyzerBot/0.1 (+https://github.com/seo-remaster/bot)`. Ek
+  imaandaar bot UA jisme contact URL ho, kabhi spoofed browser nahi. Kai stores
+  named SEO bots ko khaas taur par throttle karte hain; use dodge karne ke liye
+  browser ka roop dharna terms breach hai.
+- **robots.txt** har crawl mein ek baar fetch hota hai aur honour kiya jaata hai,
+  wildcards aur `$` anchors samet (`robots.py::path_allowed`, longest match jeetta
+  hai, tie par `Allow` `Disallow` ko haraata hai). Hamare apne token ka naam lene
+  wala group `*` ko haraata hai. Blanket `Disallow: /` ko POST par hi 403 ke saath
+  refuse kar diya jaata hai.
+- **Matched path mein query string shaamil hai** (`robots_target`). Shopify
+  `Disallow: /*?*oseid=*` ship karta hai, aur sirf bare path match karne se wo har
+  URL allow ho jaata jise exclude karne ke liye aisa rule bana hai.
+- **`Crawl-delay`** requests ke beech floor ke roop mein use hota hai, 2s par
+  clamped, taaki koi hostile value ek job ko ghanton tak atka na sake.
+- **`HostGate`** poori requests ke bajaye request *starts* ko serialise karta hai,
+  isliye `concurrency` workers in-flight rehte hue bhi rate ceiling bani rehti hai.
+  Site crawl ke liye default floor 0.1s hai; catalog crawl 0.06s use karta hai
+  kyunki ek `<head>` read poore page se halka hota hai.
+- **SSRF.** Seed host ko `is_public_host` se check kiya jaata hai (loopback,
+  private, link-local, reserved, multicast reject). Frontier mein aane wala har URL
+  same-site hona chahiye, taaki target ke control wala koi document crawler ko
+  kisi naye host par na mod sake. httpx redirects ko phir bhi kahin bhi follow
+  karta hai, isliye links follow karne se pehle *final* URL par same-site rule
+  dobara lagaya jaata hai.
 
 ---
 
-## 5. Rate limiting: wait, do not give up
+## 5. Rate limiting: wait karo, give up mat karo
 
-A 429 means "too fast", not "go away". This was the single biggest source of
-truncated crawls and the handling is deliberately patient.
+429 ka matlab hai "bahut tez", "chale jao" nahi. Truncated crawls ka ye sabse bada
+single source tha, aur handling jaan-boojh kar patient rakhi gayi hai.
 
-1. The page is **retried**, up to `MAX_THROTTLE_RETRIES = 4` attempts.
-2. `Retry-After` is honoured when the host sends a numeric one, capped at
-   `MAX_RETRY_AFTER_S = 60`. A date-formatted header is ignored rather than
-   guessed at.
-3. `HostGate.back_off()` quadruples the interval between requests, up to
-   `THROTTLED_MAX_INTERVAL_S = 30s` for a site crawl. The catalog crawl keeps its
-   own 2s ceiling: the ceiling is per gate, not global.
-4. `HostGate.recover()` eases the interval back toward the floor (factor 0.8) on
-   every response the host was happy with, so one 429 early in a long crawl does
-   not slow every later page.
-5. If a page still cannot be read, **that page** is recorded as unreachable
-   (`gave_up_throttled`) and the crawl continues.
+1. Page ko **retry** kiya jaata hai, `MAX_THROTTLE_RETRIES = 4` attempts tak.
+2. Jab host numeric `Retry-After` bhejta hai to use honour kiya jaata hai,
+   `MAX_RETRY_AFTER_S = 60` par capped. Date-format wala header guess karne ke
+   bajaye ignore kiya jaata hai.
+3. `HostGate.back_off()` requests ke beech ka interval chaar guna kar deta hai,
+   site crawl ke liye `THROTTLED_MAX_INTERVAL_S = 30s` tak. Catalog crawl apni 2s
+   ceiling rakhta hai: ceiling per gate hai, global nahi.
+4. `HostGate.recover()` har us response par interval ko wapas floor ki taraf
+   (factor 0.8) laata hai jisse host khush tha, taaki lambe crawl mein shuru ka ek
+   429 baad ke har page ko slow na kare.
+5. Agar page phir bhi nahi padha ja sakta, to **wo page** unreachable record hota
+   hai (`gave_up_throttled`) aur crawl chalta rehta hai.
 
-`503` is treated as throttling too, not as a server error, because that is what
-it usually means in practice from a rate limiter.
+`503` ko bhi throttling maana jaata hai, server error nahi, kyunki practice mein
+rate limiter se aksar yahi matlab hota hai.
 
-Counters: `stats.throttled` (responses received) and `stats.gave_up_throttled`
-(pages finally abandoned). Both reach the API, so a report can say "we got 280 of
-your 300 pages, the rest were rate-limited".
+Counters: `stats.throttled` (mile hue responses) aur `stats.gave_up_throttled`
+(aakhir mein chhode gaye pages). Dono API tak pahunchte hain, taaki report keh
+sake "aapke 300 mein se 280 pages mile, baaki rate-limited the".
 
 ---
 
 ## 6. URL rules
 
-Dedupe decisions are what make a crawl terminate, so they are applied at
-**enqueue** time, before `seen`, never at report time.
+Dedupe decisions hi crawl ko terminate karwate hain, isliye ye **enqueue** time par,
+`seen` se pehle lagte hain, report time par kabhi nahi.
 
 **Normalisation** (`urls.py::normalize_url`):
 
-- Fragments dropped. `#anything` cannot change the response body.
-- 33 known tracking parameters dropped (`utm_*`, `gclid`, `fbclid`, `msclkid`,
-  `mc_cid`, …). Without this, a marketing site spends its whole page budget on
-  one page wearing forty campaign tags.
-- Remaining query parameters **sorted**, so `?a=1&b=2` and `?b=2&a=1` are one
-  entry in `seen`.
-- Scheme and host lower-cased; default ports stripped, non-default kept.
-- Empty path becomes `/`.
-- **Trailing slashes are preserved.** `/a` and `/a/` really can be different
-  documents, so collapsing them would under-report.
-- Non-http(s) schemes, malformed URLs and hosts containing invalid characters
-  return `None`, which callers treat as "ignore", never as an error.
+- Fragments drop. `#anything` response body nahi badal sakta.
+- 33 jaane-maane tracking parameters drop (`utm_*`, `gclid`, `fbclid`, `msclkid`,
+  `mc_cid`, …). Iske bina ek marketing site apna poora page budget ek hi page par
+  chaalis campaign tags pehne hue kharch kar deti hai.
+- Bache hue query parameters **sort** hote hain, taaki `?a=1&b=2` aur `?b=2&a=1`
+  `seen` mein ek hi entry hon.
+- Scheme aur host lower-case; default ports hata diye, non-default rakhe.
+- Khaali path `/` ban jaata hai.
+- **Trailing slashes preserve hote hain.** `/a` aur `/a/` sach mein alag documents
+  ho sakte hain, isliye unhe collapse karna under-report karega.
+- Non-http(s) schemes, malformed URLs aur invalid characters wale hosts `None`
+  return karte hain, jise callers "ignore" maante hain, error kabhi nahi.
 
-`normalize_seed_url` is the separate variant for a URL a *person typed*: it
-assumes `https` when there is no scheme at all. It is deliberately not used for
-link extraction, which must never invent a scheme for an `href`.
+`normalize_seed_url` us URL ke liye alag variant hai jo *insaan ne type kiya*:
+scheme bilkul na ho to ye `https` maan leta hai. Ise jaan-boojh kar link extraction
+ke liye use nahi kiya jaata, jise kisi `href` ke liye kabhi scheme invent nahi
+karna chahiye.
 
-**Not fetched at all:** 51 asset extensions (images, video, archives, fonts,
-scripts, documents). The content-type check would catch these anyway, but a 40 MB
-video is a wasted request even when the body is discarded.
+**Bilkul fetch nahi hote:** 51 asset extensions (images, video, archives, fonts,
+scripts, documents). Content-type check inhe waise bhi pakad leta, lekin 40 MB ka
+video ek bekaar request hai chahe body discard hi kyun na ho.
 
-**Link extraction** honours `<base href>`, splits internal from external, counts
-`rel="nofollow"` separately, and caps kept links at `MAX_LINKS_PER_PAGE = 300` —
-a nav-heavy template lists the same header and footer on every page, and the tail
-has no graph value.
-
----
-
-## 7. Page types: products, collections, or both
-
-`CrawlLimits.page_types` restricts the crawl to catalog page types. Empty means
-every page, which is the default and the original behaviour.
-
-Classification is **from the URL path alone**
-(`urls.py::classify_catalog_url`), which is what makes the filter cheap: the
-crawl decides whether it wants a page *before* spending a request on it.
-`/products/<handle>` is a product, `/collections/<handle>` is a collection, and
-Shopify's virtual `/collections/all` and `/collections/frontpage` are neither.
-The rule works on any store using that convention, not only Shopify.
-
-A filtered crawl still has to *reach* the pages it wants — a store's home page
-and collection listings are the only route to its product pages. So:
-
-- A URL matching the filter is a **target**: fetched, analyzed, stored, and
-  counted against `max_pages`.
-- A URL outside the filter is **navigation**: fetched for its links only, not
-  analyzed, and charged to a separate `max_navigation_pages` budget so it never
-  eats the page budget.
-- Running out of navigation budget ends the *detour*, not the crawl.
-
-`CrawledPage.is_target` records which one a page was. Reads exclude navigation
-pages by default (`include_navigation=true` opts in), and the filter uses
-`{"is_target": {"$ne": False}}` so documents written before the field existed
-still count as targets, which they were.
-
-A skipped URL is classified too. A robots-blocked *product* page is still part of
-a products-only report, because we asked for it and could not have it; a
-robots-blocked account page is not.
+**Link extraction** `<base href>` ko honour karta hai, internal ko external se
+alag karta hai, `rel="nofollow"` alag se ginta hai, aur rakhe gaye links ko
+`MAX_LINKS_PER_PAGE = 300` par cap karta hai — nav-heavy template har page par
+wahi header aur footer list karta hai, aur tail ki koi graph value nahi hoti.
 
 ---
 
-## 8. Seeding from the sitemap
+## 7. Page types: products, collections, ya dono
 
-On by default (`CrawlLimits.seed_from_sitemap`). `/sitemap.xml` plus every
-`Sitemap:` line in robots.txt, following nested indexes one level, at most
-`MAX_SITEMAP_FETCHES = 10` documents.
+`CrawlLimits.page_types` crawl ko catalog page types tak restrict karta hai. Khaali
+ka matlab har page, jo default aur original behaviour hai.
 
-This is what makes **orphan detection** possible: a page listed in the sitemap
-that no crawled page links to has no internal path to it.
+Classification **sirf URL path se** hoti hai (`urls.py::classify_catalog_url`),
+isi wajah se filter sasta hai: crawl request kharch karne se *pehle* tay kar leta
+hai ki use page chahiye ya nahi. `/products/<handle>` product hai,
+`/collections/<handle>` collection hai, aur Shopify ke virtual `/collections/all`
+aur `/collections/frontpage` dono mein se kuch nahi. Rule us convention wale kisi
+bhi store par kaam karta hai, sirf Shopify par nahi.
 
-Two details worth knowing:
+Filtered crawl ko phir bhi apne chahe pages tak *pahunchna* padta hai — store ka
+home page aur collection listings hi product pages tak ka ek-matr raasta hain.
+Isliye:
 
-- Sitemap XML is parsed with a **bounded regex over `<loc>`**, never an XML
-  parser. The document comes from a user-supplied host, and while XXE is not
-  reachable on CPython 3.12, entity-expansion DoS is. We need exactly one thing,
-  the text of `<loc>`, so this is token extraction from an untrusted document
-  rather than parsing.
-- `looks_like_sitemap` checks the body, because some hosts answer `/sitemap.xml`
-  with HTTP 200 and their themed not-found page. python.org does exactly this.
+- Filter se match hone wala URL **target** hai: fetch, analyze, store hota hai aur
+  `max_pages` mein gina jaata hai.
+- Filter ke bahar wala URL **navigation** hai: sirf uske links ke liye fetch, analyze
+  nahi hota, aur alag `max_navigation_pages` budget mein charge hota hai taaki wo
+  page budget kabhi na khaaye.
+- Navigation budget khatam hona *detour* khatam karta hai, crawl nahi.
 
-**Seed cap.** Twice the page budget, floored at 100 — or `MAX_SITEMAP_SEEDS =
-25000` when there is no page budget to derive it from. The note *"sitemap seeding
-stopped at N URLs"* means that cap was reached; it is information, not an error.
+`CrawledPage.is_target` record karta hai ki page in dono mein se kya tha. Reads
+default mein navigation pages exclude karte hain (`include_navigation=true` se opt
+in), aur filter `{"is_target": {"$ne": False}}` use karta hai taaki field ke aane se
+pehle likhe gaye documents ab bhi targets ginein, jo wo the hi.
+
+Skip kiya gaya URL bhi classify hota hai. Robots-blocked *product* page phir bhi
+products-only report ka hissa hai, kyunki humne use maanga tha aur mil nahi saka;
+robots-blocked account page nahi hai.
+
+---
+
+## 8. Sitemap se seeding
+
+Default mein on (`CrawlLimits.seed_from_sitemap`). `/sitemap.xml` plus robots.txt
+ki har `Sitemap:` line, nested indexes ek level tak follow karte hue, zyada se
+zyada `MAX_SITEMAP_FETCHES = 10` documents.
+
+Yahi cheez **orphan detection** ko possible banati hai: sitemap mein listed jo page
+kisi crawled page se link nahi hota, us tak koi internal raasta nahi hai.
+
+Do baatein jaanne layak:
+
+- Sitemap XML ko `<loc>` par **bounded regex** se parse kiya jaata hai, XML parser
+  se kabhi nahi. Document user-supplied host se aata hai, aur CPython 3.12 par XXE
+  reachable nahi hai lekin entity-expansion DoS hai. Humein bilkul ek cheez chahiye,
+  `<loc>` ka text, isliye ye untrusted document se token extraction hai, parsing
+  nahi.
+- `looks_like_sitemap` body check karta hai, kyunki kuch hosts `/sitemap.xml` ka
+  jawab HTTP 200 aur apne themed not-found page se dete hain. python.org bilkul
+  yahi karta hai.
+
+**Seed cap.** Page budget ka do guna, 100 par floored — ya `MAX_SITEMAP_SEEDS =
+25000` jab derive karne ke liye koi page budget hi na ho. Note *"sitemap seeding
+stopped at N URLs"* ka matlab hai wo cap pahunch gaya; ye information hai, error
+nahi.
 
 ---
 
 ## 9. Page analysis
 
-Analyzers run **inside** the crawl, through the `page_hook` seam, because the DOM
-exists only while a page is being reduced to facts. Scoring afterwards would mean
-fetching the whole site twice.
+Analyzers crawl ke **andar** chalte hain, `page_hook` seam ke through, kyunki DOM
+sirf tab tak exist karta hai jab tak page facts mein reduce ho raha hota hai. Baad
+mein score karne ka matlab hota poori site do baar fetch karna.
 
-Only analyzers that read the `PageData` they are handed are safe in bulk:
+Sirf wahi analyzers bulk mein safe hain jo unhe di gayi `PageData` padhte hain:
 
-| Analyzer | Bulk-safe | Why |
+| Analyzer | Bulk-safe | Kyun |
 |---|---|---|
-| `on_page` | yes | titles, descriptions, headings, images, links — ~1 ms |
-| `technical` | yes | robots, canonical, viewport, status, timing — ~1 ms |
-| `pagespeed` | no | a Lighthouse run per page |
-| `content_ai` | no | an LLM completion per page |
-| `search_console` | no | a Google API query per page |
+| `on_page` | haan | titles, descriptions, headings, images, links — ~1 ms |
+| `technical` | haan | robots, canonical, viewport, status, timing — ~1 ms |
+| `pagespeed` | nahi | har page par ek Lighthouse run |
+| `content_ai` | nahi | har page par ek LLM completion |
+| `search_console` | nahi | har page par ek Google API query |
 
-`services/site_crawl_analysis.py::BULK_SAFE` enforces this: a name configured
-outside the set is refused with a log line rather than quietly running up an API
-bill. Configure with `SITE_CRAWL_ANALYZERS`; an empty value turns scoring off,
-which is different from every page scoring zero (`avg_score` is then `null`).
+`services/site_crawl_analysis.py::BULK_SAFE` ise enforce karta hai: set ke bahar
+configure kiya gaya naam chupchaap API bill badhaane ke bajaye ek log line ke saath
+refuse hota hai. `SITE_CRAWL_ANALYZERS` se configure karein; khaali value scoring
+off kar deti hai, jo har page ke zero score karne se alag hai (`avg_score` tab
+`null` hota hai).
 
-Each page gets a weighted `score`, a `grade`, per-analyzer scores, and up to
-`MAX_FINDINGS_PER_PAGE = 25` non-passed findings, most urgent first. Passed
-checks are not stored — the score already carries that news. Navigation pages are
-never scored.
+Har page ko ek weighted `score`, ek `grade`, per-analyzer scores, aur zyada se
+zyada `MAX_FINDINGS_PER_PAGE = 25` non-passed findings milti hain, sabse urgent
+pehle. Passed checks store nahi hote — score wo khabar pehle hi carry karta hai.
+Navigation pages kabhi score nahi hote.
 
 ---
 
-## 10. What gets stored
+## 10. Kya store hota hai
 
-**SQL (`site_crawls`)** holds job state, so the client can always poll it. Every
-counter ships in one row: progress, skip reasons per category, why it stopped,
-the headline findings, and the analysis roll-up.
+**SQL (`site_crawls`)** job state rakhta hai, taaki client hamesha use poll kar
+sake. Har counter ek hi row mein aata hai: progress, category-wise skip reasons,
+kyun ruka, headline findings, aur analysis roll-up.
 
-> Columns added after the table first existed are **nullable** and read as
-> `row.x or 0`. `db/session.py::_add_missing_columns` can only `ALTER TABLE ADD` a
-> column that is nullable or carries a server default, and
-> `Integer, nullable=False, default=0` is a Python-side default that does not
-> qualify. This has bitten twice; check it before adding a counter.
+> Table ke pehli baar banne ke baad add kiye gaye columns **nullable** hain aur
+> `row.x or 0` ki tarah padhe jaate hain. `db/session.py::_add_missing_columns`
+> sirf wahi column `ALTER TABLE ADD` kar sakta hai jo nullable ho ya server default
+> carry karta ho, aur `Integer, nullable=False, default=0` ek Python-side default
+> hai jo qualify nahi karta. Ye do baar kaat chuka hai; counter add karne se pehle
+> ise check karein.
 
-**MongoDB (`site_crawl_pages`)** holds one document per `(crawl_id, url)`. Keyed
-by crawl rather than by host on purpose: a site crawl is a snapshot, and the value
-of keeping two is comparing them. Writes are best-effort — a failure is logged and
-surfaced as `persistence_ok`, never raised to the client. The crawl still ran and
-its counters are in SQL.
+**MongoDB (`site_crawl_pages`)** har `(crawl_id, url)` ke liye ek document rakhta
+hai. Jaan-boojh kar host ke bajaye crawl se keyed: site crawl ek snapshot hai, aur do
+rakhne ki value unhe compare karne mein hai. Writes best-effort hain — failure log
+hota hai aur `persistence_ok` ke roop mein surface hota hai, client tak kabhi raise
+nahi hota. Crawl phir bhi chala aur uske counters SQL mein hain.
 
-HTML is **never** retained. `services/stores/enrichment.py` learned that the
-expensive way: 5,000 pages x 90 KiB of markup is 450 MB. A page is reduced to its
-facts the moment it is parsed and the markup is dropped.
+HTML **kabhi** retain nahi hota. `services/stores/enrichment.py` ne ye mehenga
+sabak seekha: 5,000 pages x 90 KiB markup = 450 MB. Page parse hote hi facts mein
+reduce ho jaata hai aur markup drop kar diya jaata hai.
 
-Reads support 17 issue filters (`broken`, `orphan`, `missing_title`, `thin`,
-`critical`, `product`, …) and 6 sort orders (`depth`, `url`, `status`, `words`,
-`links`, `score`). Both are defined once in `db/site_pages.py` so the route, the
-counters and the export cannot drift apart.
+Reads 17 issue filters (`broken`, `orphan`, `missing_title`, `thin`, `critical`,
+`product`, …) aur 6 sort orders (`depth`, `url`, `status`, `words`, `links`,
+`score`) support karte hain. Dono `db/site_pages.py` mein ek baar define hain taaki
+route, counters aur export ek doosre se alag na ho jaayein.
 
 ---
 
 ## 11. Orphan detection
 
-Computed once at the end, because a page crawled first may be linked from a page
-crawled last.
+Aakhir mein ek baar compute hota hai, kyunki pehle crawl hua page aakhir mein crawl
+hue page se linked ho sakta hai.
 
-The worker keeps a set of every outlink seen and a list of every page fetched;
-the orphans are the difference, minus the seed. Memory is two sets of unique
-URLs, not a list of edges — the edge count is pages x links, the URL count is the
-site. The result is written back with `mark_orphans`, chunked at 500 per query
-because `$in` with ten thousand URLs is a query document megabytes wide.
+Worker dekhe gaye har outlink ka ek set aur fetch kiye gaye har page ki ek list
+rakhta hai; orphans in dono ka difference hain, minus seed. Memory unique URLs ke
+do sets hai, edges ki list nahi — edge count pages x links hota hai, URL count site
+hoti hai. Result `mark_orphans` se wapas likha jaata hai, har query mein 500 ke
+chunks mein, kyunki das hazaar URLs wala `$in` megabytes chauda query document
+hota hai.
 
-The seed is never an orphan. A skipped URL is never an orphan either: it was
-never fetched, so "nothing links to it" says nothing about it.
+Seed kabhi orphan nahi hota. Skip kiya gaya URL bhi kabhi orphan nahi hota: wo kabhi
+fetch hi nahi hua, isliye "usse koi link nahi karta" uske baare mein kuch nahi kehta.
 
 ---
 
-## 12. Statuses, stopping, and interruption
+## 12. Statuses, stop karna, aur interruption
 
-| Status | Meaning |
+| Status | Matlab |
 |---|---|
-| `pending` | row created, worker has not started |
-| `crawling` | running |
-| `complete` | reached the end of the site inside every bound |
-| `partial` | a bound was reached, or some pages failed — an honest answer, not a failure |
-| `stopped` | a person pressed Stop |
-| `failed` | nothing was fetched, or the crawl could not start |
+| `pending` | row ban gayi, worker abhi shuru nahi hua |
+| `crawling` | chal raha hai |
+| `complete` | har bound ke andar site ke end tak pahunch gaya |
+| `partial` | koi bound pahunch gaya, ya kuch pages fail hue — ek imaandaar jawab, failure nahi |
+| `stopped` | kisi insaan ne Stop dabaya |
+| `failed` | kuch bhi fetch nahi hua, ya crawl shuru hi nahi ho saka |
 
-**Stop is cooperative.** `POST .../stop` sets a flag that `crawl_site` checks
-between pages; the crawl then exits through its normal completion path. Cancelling
-the task instead would lose pages already fetched but not yet written. A page
-already in flight still finishes, so a stop lands within a page or two rather than
-instantly.
+**Stop cooperative hai.** `POST .../stop` ek flag set karta hai jise `crawl_site`
+pages ke beech check karta hai; crawl phir apne normal completion path se exit
+karta hai. Iske bajaye task cancel karne se wo pages kho jaate jo fetch to ho gaye
+lekin abhi likhe nahi gaye. Jo page pehle se in flight hai wo phir bhi poora hota
+hai, isliye stop turant nahi, ek-do page ke andar lagta hai.
 
-**Heartbeats.** The worker writes `heartbeat_at` on every progress flush.
-Startup reconciliation only fails rows whose heartbeat has been silent for
-`SITE_CRAWL_STALE_AFTER_S = 180`. It used to fail *every* non-terminal row, which
-meant a second process starting — even one that immediately died on a port clash —
-marked healthy running crawls as failed.
+**Heartbeats.** Worker har progress flush par `heartbeat_at` likhta hai. Startup
+reconciliation sirf un rows ko fail karta hai jinka heartbeat
+`SITE_CRAWL_STALE_AFTER_S = 180` se chup hai. Pehle ye *har* non-terminal row ko
+fail kar deta tha, jiska matlab tha ki ek doosra process shuru hona — chahe wo port
+clash par turant mar bhi jaaye — healthy running crawls ko failed mark kar deta tha.
 
-**Reaping on read.** Startup reconciliation alone is not enough: a crawl killed
-mid-run leaves a row saying `crawling` that never changes, and the client polls it
-forever. `_reap_if_abandoned` closes out a silent row the moment anyone reads it.
-A crawl running in another process is still writing a heartbeat, so it is never
-reaped by this one.
+**Read par reaping.** Sirf startup reconciliation kaafi nahi: beech run mein maara
+gaya crawl ek `crawling` kehne wali row chhod jaata hai jo kabhi nahi badalti, aur
+client use hamesha poll karta rehta hai. `_reap_if_abandoned` chup row ko usi pal
+close kar deta hai jab koi use padhta hai. Doosre process mein chal raha crawl abhi
+bhi heartbeat likh raha hota hai, isliye ye wala use kabhi reap nahi karta.
 
 ### Operational note: `uvicorn --reload`
 
-A reload restarts the process, which kills any crawl in flight. Nothing in the
-application can survive that. **Run the backend without `--reload` for real
-crawls** (`python main.py`). Under `--reload`, saving any file ends a running
-crawl and the row is closed out as interrupted.
+Reload process restart karta hai, jo in-flight kisi bhi crawl ko maar deta hai.
+Application ki koi cheez ise survive nahi kar sakti. **Asli crawls ke liye backend
+ko bina `--reload` ke chalayein** (`python main.py`). `--reload` ke under koi bhi
+file save karna running crawl khatam kar deta hai aur row interrupted ke roop mein
+close ho jaati hai.
 
-Crawls are **not resumable** across a restart. Pages already written to MongoDB
-survive and stay readable, but the crawl itself does not continue.
+Crawls restart ke paar **resumable nahi** hain. MongoDB mein pehle se likhe pages
+survive karte hain aur readable rehte hain, lekin crawl khud aage nahi badhta.
 
 ---
 
-## 13. Concurrency and resource budget
+## 13. Concurrency aur resource budget
 
-`MAX_CONCURRENT_SITE_CRAWLS = 1`. One, not two: a site crawl fetches whole pages
-(up to 2 MiB each) where the catalog crawl reads only `<head>`s, and it shares
-`http_client.DEFAULT_LIMITS` (24 connections) with 2 catalog crawls and 4 audits.
-One crawl at 6 workers is what is left without starving the endpoints a user is
-watching.
+`MAX_CONCURRENT_SITE_CRAWLS = 1`. Ek, do nahi: site crawl poore pages fetch karta
+hai (har ek 2 MiB tak) jabki catalog crawl sirf `<head>` padhta hai, aur ye
+`http_client.DEFAULT_LIMITS` (24 connections) ko 2 catalog crawls aur 4 audits ke
+saath share karta hai. 6 workers wala ek crawl hi wo hai jo un endpoints ko bhookha
+rakhe bina bachta hai jinhe user dekh raha hai.
 
-Progress flushes every 25 pages or 2 seconds, whichever comes first. The same
-boundary batches the MongoDB bulk write, so a 1,000-page crawl does about 40
-`UPDATE`s against SQLite's single writer instead of 1,000.
+Progress har 25 pages ya 2 seconds par flush hota hai, jo pehle aaye. Wahi boundary
+MongoDB bulk write ko bhi batch karti hai, isliye 1,000-page crawl SQLite ke single
+writer ke against 1,000 ke bajaye lagbhag 40 `UPDATE` karta hai.
 
 ---
 
 ## 14. Tests
 
-| File | Tests | Covers |
+| File | Tests | Kya cover karta hai |
 |---|---|---|
-| `tests/test_site_crawl.py` | 64 | the engine: traversal, bounds, robots, throttling, page types, stop |
-| `tests/test_crawler_urls.py` | 19 | normalisation and link extraction, no I/O |
+| `tests/test_site_crawl.py` | 64 | engine: traversal, bounds, robots, throttling, page types, stop |
+| `tests/test_crawler_urls.py` | 19 | normalisation aur link extraction, bina I/O |
 | `tests/test_site_crawl_worker.py` | 26 | status transitions, orphans, scheduling, heartbeats, reconciliation |
 | `tests/test_site_crawl_routes.py` | 31 | HTTP contract, validation, reaping, stop |
-| `tests/test_site_crawl_integration.py` | 15 | POST through worker to storage, only HTTP and Mongo stubbed |
+| `tests/test_site_crawl_integration.py` | 15 | POST se worker se storage tak, sirf HTTP aur Mongo stubbed |
 
-The integration tests stub only the network (respx) and MongoDB (a dict). They
-drive `run_site_crawl` directly rather than through the scheduler, because the
-detached task lands on TestClient's own event loop, which stops when the response
-is sent.
+Integration tests sirf network (respx) aur MongoDB (ek dict) ko stub karte hain. Ye
+`run_site_crawl` ko scheduler ke bajaye seedha drive karte hain, kyunki detached
+task TestClient ke apne event loop par utarta hai, jo response bhejte hi ruk jaata
+hai.
 
 ---
 
-## 15. Things to know before changing this
+## 15. Ise badalne se pehle jaanne layak baatein
 
-- **Bounds are not advisory.** If you add a loop that can fetch, give it a
-  ceiling and a counter, and make reaching it a reported outcome rather than an
-  exception.
-- **A new counter column must be nullable.** See section 10.
-- **Do not import upward.** `services/crawler/` must not import from
-  `services/stores/`; shared helpers moved down into the crawler layer for
-  exactly this reason (`throttle.py`, `sitemap.py`, the URL classifier).
-  `config/settings.py` must not import from `services/` either, which is why
-  `CrawlLimits.from_settings` reads settings with `getattr` from the crawler side.
-- **The analyzer seam is a hook, not an import.** `site_crawl.py` stays ignorant
-  of `services.analyzers`, which itself imports `services.crawler.parser`.
-- **One page must never take down the crawl.** Every per-page failure path ends
-  in a `CrawledPage` with `error` or `skipped` set.
+- **Bounds advisory nahi hain.** Agar aap koi aisa loop add karte hain jo fetch kar
+  sakta hai, to use ceiling aur counter dein, aur wahan pahunchne ko exception ke
+  bajaye reported outcome banayein.
+- **Naya counter column nullable hona chahiye.** Section 10 dekhein.
+- **Upar ki taraf import mat karein.** `services/crawler/` ko `services/stores/` se
+  import nahi karna chahiye; shared helpers isi wajah se neeche crawler layer mein
+  laaye gaye (`throttle.py`, `sitemap.py`, URL classifier). `config/settings.py` ko
+  bhi `services/` se import nahi karna chahiye, isi liye `CrawlLimits.from_settings`
+  crawler side se `getattr` ke saath settings padhta hai.
+- **Analyzer seam ek hook hai, import nahi.** `site_crawl.py` `services.analyzers`
+  se anjaan rehta hai, jo khud `services.crawler.parser` import karta hai.
+- **Ek page kabhi poora crawl nahi giraana chahiye.** Har per-page failure path
+  `error` ya `skipped` set wale `CrawledPage` par khatam hota hai.

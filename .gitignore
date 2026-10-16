@@ -31,3 +31,10 @@ __pycache__/
 # Tooling caches
 .pytest_cache/
 .ruff_cache/
+
+# Secret-bearing variants of .env (.env itself is ignored above).
+# A staged .env.bak once put live Google/Gemini keys one commit away from history.
+.env.bak
+.env.local
+.env.*.local
+*.bak

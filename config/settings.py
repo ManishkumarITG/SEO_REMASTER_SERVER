@@ -63,6 +63,42 @@ class Settings(BaseSettings):
     # Gemini (Reddit draft generation). Empty key -> the drafts endpoint answers 503.
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash"
+    # When the primary model is persistently overloaded (5xx after retries), the
+    # report/text path falls back to these models in order. They are separate flash
+    # deployments, so a capacity spike on one rarely hits all at once, and the last
+    # is a lite model that is almost always free. They are all confirmed callable on
+    # a flash-tier key (pro models answer 429 without pro quota; the 2.5 line answers
+    # 404 for new keys). Comma-separated; blank disables fallback so the primary
+    # model's error surfaces as before.
+    gemini_fallback_models: str = "gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash-lite"
+
+    # Ollama (local report engine: `?engine=ollama` on the report routes). The
+    # model must already be pulled - `ollama pull qwen3:4b`. A blank base URL
+    # makes the Ollama report answer 503; Gemini is unaffected.
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen3:4b"
+    # A 4B model on CPU generates ~9 tokens/s: the crawl report takes ~6 minutes
+    # and the full-analysis report (a ~23k-token prompt) 10-15. On a GPU it is
+    # several times faster. Generous on purpose - a timeout throws the work away.
+    ollama_timeout_s: float = 1800.0
+    # Ollama's default window is 4096 tokens and it truncates a longer prompt from
+    # the START - our system instruction. This floor is sent on every request; the
+    # client raises it per call when a prompt needs more.
+    ollama_num_ctx: int = 16384
+
+    # Claude via the Claude Code CLI (`?engine=claude`): no API key. The report is
+    # written by the `claude` command already logged in on this machine, on that
+    # account's subscription. The path is a command name on PATH or a full path;
+    # an npm `claude.cmd` shim is resolved to the claude.exe it wraps. Blank model
+    # and effort leave the CLI's own defaults in charge (aliases: sonnet, opus, fable).
+    claude_cli_path: str = "claude"
+    claude_cli_model: str = ""
+    claude_cli_effort: str = ""
+    # One long generation plus a few seconds of CLI start-up. The small crawl
+    # report took ~3 min on Fable at xhigh effort; the full-analysis report can
+    # take longer. A timeout kills the process tree and the report is lost, so
+    # leave headroom.
+    claude_cli_timeout_s: float = 900.0
 
     # Reddit OAuth (Backlink tab). Empty client id/secret -> /auth/reddit/* answers 503.
     reddit_client_id: str = ""

@@ -29,6 +29,10 @@ _MAX_OUTPUT_TOKENS = 2048
 #: A full audit report is far longer than a Reddit draft, so the text path takes
 #: its own, larger ceiling rather than the structured default above.
 _MAX_REPORT_TOKENS = 8192
+#: The text path retries a transient 5xx ("high demand"), which is common on the
+#: flash models at peak. Total added wait on a bad spell is ~2s + 4s = 6s.
+_TEXT_ATTEMPTS = 3
+_TEXT_RETRY_BACKOFF_S = 2.0
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -53,11 +57,37 @@ class GeminiService:
         settings = get_settings()
         self._api_key = settings.gemini_api_key if api_key is None else api_key
         self.model = model or settings.gemini_model
+        self._fallback_models = [
+            m.strip() for m in settings.gemini_fallback_models.split(",") if m.strip()
+        ]
         self._client: Any = None
 
     @property
     def is_configured(self) -> bool:
         return bool(self._api_key)
+
+    def _text_model_chain(self) -> list[str]:
+        """The primary model first, then any distinct configured fallbacks.
+
+        A report is expensive to abandon, so when the primary model is saturated the
+        text path retries down this list. Fallbacks are deliberately from another
+        generation, which sits in a separate capacity pool.
+        """
+        chain = [self.model]
+        for name in self._fallback_models:
+            if name and name not in chain:
+                chain.append(name)
+        return chain
+
+    @staticmethod
+    def _reply_text(response: Any) -> str:
+        """`.text` concatenates the parts; it returns None (and can warn) when the
+        reply carried no text at all - a safety block, or a stop before any token."""
+        try:
+            return (response.text or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gemini reply had no readable text (%s): %s", type(exc).__name__, exc)
+            return ""
 
     def _get_client(self) -> Any:
         if not self._api_key:
@@ -83,11 +113,17 @@ class GeminiService:
         """One free-text call, returning the model's text as-is.
 
         Separate from `generate_structured` because a report is prose, not JSON:
-        no schema, no validation, no retry-for-shape. Errors are still funnelled
-        into GeminiError so a route maps them to 502 rather than a bare 500, and
-        an empty reply (a safety block, or a stop before any token) is surfaced as
-        GeminiResponseError so the caller never ships a blank file.
+        no schema, no validation, no retry-for-shape. A transient 5xx ("model is
+        experiencing high demand") IS retried with backoff, because it is
+        explicitly temporary and a report is expensive to abandon; if a model stays
+        overloaded past its retries the call falls back to the next model in the
+        chain (a different generation, a different capacity pool). Errors are
+        funnelled into GeminiError so a route maps them to 502 rather than a bare
+        500, and an empty reply (a safety block, or a stop before any token) is
+        surfaced as GeminiResponseError so the caller never ships a blank file.
         """
+        import asyncio
+
         from google.genai import errors as genai_errors
         from google.genai import types
 
@@ -97,25 +133,60 @@ class GeminiService:
             temperature=temperature,
             max_output_tokens=max_output_tokens,
         )
-        try:
-            response = await client.aio.models.generate_content(
-                model=self.model, contents=prompt, config=config
-            )
-        except genai_errors.APIError as exc:
-            logger.warning("Gemini API error (%s): %s", type(exc).__name__, exc)
-            raise GeminiError(f"Gemini request failed: {getattr(exc, 'message', exc)}") from exc
-        except Exception as exc:  # noqa: BLE001 - httpx errors are not APIError; see generate_structured
-            logger.warning("Gemini call failed (%s): %s", type(exc).__name__, exc)
-            raise GeminiError(f"Gemini request failed: {type(exc).__name__}") from exc
+        chain = self._text_model_chain()
+        last_error: Exception | None = None
+        for model_index, model in enumerate(chain):
+            is_primary = model_index == 0
+            for attempt in range(1, _TEXT_ATTEMPTS + 1):
+                try:
+                    response = await client.aio.models.generate_content(
+                        model=model, contents=prompt, config=config
+                    )
+                except genai_errors.ServerError as exc:
+                    # 5xx / UNAVAILABLE / 504: the API itself is momentarily
+                    # overloaded, not a problem with our request. Retry, then fall
+                    # back to the next model once this one's retries are spent.
+                    last_error = exc
+                    logger.warning(
+                        "Gemini overloaded (%s) attempt %d/%d: %s",
+                        model, attempt, _TEXT_ATTEMPTS, exc,
+                    )
+                    if attempt < _TEXT_ATTEMPTS:
+                        await asyncio.sleep(_TEXT_RETRY_BACKOFF_S * attempt)
+                        continue
+                    break  # exhausted this model -> try the next in the chain
+                except genai_errors.APIError as exc:
+                    # A 4xx is our fault (bad request, quota, auth). On the primary
+                    # model that is fatal; on a fallback it usually just means that
+                    # model name is not available here, so move to the next one.
+                    last_error = exc
+                    if is_primary:
+                        logger.warning("Gemini API error (%s): %s", type(exc).__name__, exc)
+                        raise GeminiError(
+                            f"Gemini request failed: {getattr(exc, 'message', exc)}"
+                        ) from exc
+                    logger.warning(
+                        "Gemini fallback %s unavailable (%s): %s", model, type(exc).__name__, exc
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 - httpx errors are not APIError
+                    # A connect/read timeout or TLS/DNS error hits the shared
+                    # endpoint, so a fallback model would fail the same way: stop.
+                    last_error = exc
+                    logger.warning("Gemini call failed (%s): %s", type(exc).__name__, exc)
+                    raise GeminiError(f"Gemini request failed: {type(exc).__name__}") from exc
 
-        try:
-            text = (response.text or "").strip()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Gemini reply had no readable text (%s): %s", type(exc).__name__, exc)
-            text = ""
-        if not text:
-            raise GeminiResponseError("Gemini returned an empty reply", raw="")
-        return text
+                text = self._reply_text(response)
+                if not text:
+                    # An empty reply is a content decision (safety block / no token),
+                    # not a capacity problem, so another model would not help.
+                    raise GeminiResponseError("Gemini returned an empty reply", raw="")
+                if not is_primary:
+                    logger.info("Gemini text generated by fallback model %s", model)
+                return text
+
+        detail = getattr(last_error, "message", None) or type(last_error).__name__
+        raise GeminiError(f"Gemini request failed after {len(chain)} model(s): {detail}")
 
     async def generate_structured(
         self,
@@ -165,15 +236,9 @@ class GeminiService:
                 logger.warning("Gemini call failed (%s): %s", type(exc).__name__, exc)
                 raise GeminiError(f"Gemini request failed: {type(exc).__name__}") from exc
 
-            # `.text` is a property that concatenates the parts; it returns None
-            # (and can warn) when the reply carried no text at all, e.g. a safety
-            # block or a stop before any token. Treat that as an unusable reply
-            # and let the retry ask again rather than crashing on None.
-            try:
-                raw = (response.text or "").strip()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Gemini reply had no readable text (%s): %s", type(exc).__name__, exc)
-                raw = ""
+            # An empty reply (safety block, or a stop before any token) is unusable;
+            # let the retry ask again rather than crashing on None.
+            raw = self._reply_text(response)
             try:
                 return schema.model_validate_json(_strip_fences(raw))
             except ValidationError as exc:

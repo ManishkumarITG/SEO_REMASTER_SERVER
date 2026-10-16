@@ -7,9 +7,11 @@ exactly what they meant before.
 """
 
 from exceptions.backlinks import DraftValidationError, GuardrailError
+from exceptions.claude_cli import ClaudeCliError, ClaudeCliNotConfigured, ClaudeCliResponseError
 from exceptions.crawler import FetchError
 from exceptions.gemini import GeminiError, GeminiNotConfigured, GeminiResponseError
 from exceptions.llm import LLMError, LLMJSONError, LLMNotConfiguredError
+from exceptions.ollama import OllamaError, OllamaNotConfigured, OllamaResponseError
 from exceptions.reddit import (
     RedditAPIError,
     RedditAuthError,
@@ -22,6 +24,9 @@ from exceptions.stores import CatalogUnavailable, RobotsDisallowed
 
 __all__ = [
     "CatalogUnavailable",
+    "ClaudeCliError",
+    "ClaudeCliNotConfigured",
+    "ClaudeCliResponseError",
     "DraftValidationError",
     "FetchError",
     "GeminiError",
@@ -31,6 +36,9 @@ __all__ = [
     "LLMError",
     "LLMJSONError",
     "LLMNotConfiguredError",
+    "OllamaError",
+    "OllamaNotConfigured",
+    "OllamaResponseError",
     "RedditAPIError",
     "RedditAuthError",
     "RedditError",

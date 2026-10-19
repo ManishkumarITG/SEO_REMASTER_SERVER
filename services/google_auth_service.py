@@ -40,7 +40,13 @@ async def login(session: MutableMapping[str, Any]) -> RedirectResponse:
     # granted scopes into our token would over-privilege it.
     auth_url, state = flow.authorization_url(
         access_type="offline",  # ask for a refresh token
-        prompt="consent",  # guarantees a refresh token even on repeat connects
+        # "consent" guarantees a refresh token even on repeat connects.
+        # "select_account" is what makes switching accounts possible at all: with
+        # consent alone, a browser signed into exactly one Google account never
+        # sees a chooser, so Google silently reuses that account. An agency
+        # signed into a personal account then connects it, gets zero properties,
+        # and has no way to reach the account that actually owns the sites.
+        prompt="select_account consent",
     )
     # Validated in the callback - CSRF protection for the OAuth flow.
     session["oauth_state"] = state

@@ -22,7 +22,6 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException
 
 from config import get_settings
-from db import mongo
 from integrations.google.oauth import (
     execute_google_call,
     get_search_console_service,
@@ -210,18 +209,6 @@ class SearchConsoleAnalyzer(BaseAnalyzer):
             dimensions=["page", "query"], start_date=start_date, end_date=end_date,
             row_limit=TOP_QUERY_LIMIT,
         )
-
-        # Mirror into MongoDB using the same shape as /api/search-analytics.
-        # `page` is part of the dimension key, so page-scoped audit pulls never
-        # collide with site-wide pulls of the same date range.
-        if totals_rows:
-            await mongo.save_search_analytics(
-                user_id, site, start_date, end_date, ["page"], totals_rows
-            )
-        if query_rows:
-            await mongo.save_search_analytics(
-                user_id, site, start_date, end_date, ["page", "query"], query_rows
-            )
 
         return self._build_result(site, page.final_url, start_date, end_date, totals_rows, query_rows)
 

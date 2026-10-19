@@ -24,7 +24,6 @@ async def mongo_db(monkeypatch: pytest.MonkeyPatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "mongodb_db", TEST_DB, raising=False)
     monkeypatch.setattr(mongo, "_client", None)
-    monkeypatch.setattr(mongo, "_indexes_ready", False)
     monkeypatch.setattr(catalog, "_indexed_client", None)
     if not await mongo.ping():
         pytest.skip("no local MongoDB on MONGODB_URL")

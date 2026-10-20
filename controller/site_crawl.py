@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from schemas import (
     ReportEngine,
+    SiteCrawlCatalogResponse,
     SiteCrawlCreatedResponse,
     SiteCrawlCreateRequest,
     SiteCrawlIssuesResponse,
@@ -72,6 +73,20 @@ async def get_site_crawl_templates(
     crawl_id: str, session: AsyncSession
 ) -> SiteCrawlTemplatesResponse:
     return await site_crawl_service.get_site_crawl_templates(crawl_id, session)
+
+
+async def get_site_crawl_catalog(
+    crawl_id: str,
+    session: AsyncSession,
+    *,
+    kind: str | None,
+    gap: str | None,
+    offset: int,
+    limit: int,
+) -> SiteCrawlCatalogResponse:
+    return await site_crawl_service.get_site_crawl_catalog(
+        crawl_id, session, kind=kind, gap=gap, offset=offset, limit=limit
+    )
 
 
 async def get_site_crawl_export(

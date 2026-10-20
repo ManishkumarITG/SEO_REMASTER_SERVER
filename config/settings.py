@@ -139,8 +139,31 @@ class Settings(BaseSettings):
     # rate-limited crawl legitimately needs longer. The Stop button is the
     # interruption that matters; this is only the backstop.
     site_crawl_deadline_s: int = 30 * 60
+    # ...but a fixed 30 minutes cut an 8,000-page store off at 701 pages. Once the
+    # sitemap has been read the deadline grows to (expected pages x this), so a
+    # large site gets the time it needs. 1 s/page assumes the host tolerates at
+    # least ~1 req/s; 0 turns the sizing off and keeps the fixed deadline.
+    site_crawl_deadline_per_target_s: float = 1.0
+    # Hard ceiling on that sized deadline, however large the sitemap claims to be.
+    site_crawl_deadline_max_s: int = 6 * 60 * 60
     #: Floor between request starts. robots Crawl-delay raises it, never lowers it.
     site_crawl_min_interval_s: float = 0.1
+    # Where the adaptive rate limiter starts on a host it has never crawled, in
+    # requests per second. It grows from here until the host first pushes back,
+    # then settles just under that rate. A re-crawl of a known host starts at the
+    # rate the previous crawl learned instead.
+    site_crawl_initial_rate_rps: float = 4.0
+    # Catalog-first: on a Shopify store, read every product and collection from
+    # /products.json and /collections.json (250 per request) before fetching any
+    # page, so the catalog's findings land within about a minute and the page
+    # crawl's target list is the whole catalog, not just what the sitemap lists.
+    site_crawl_catalog_first: bool = True
+    site_crawl_catalog_max_products: int = 50_000
+    site_crawl_catalog_max_collections: int = 5_000
+    # Wall clock for the catalog phase. ~200 requests at 1 req/s covers 50,000
+    # products; past this the catalog is recorded as partial and the page crawl
+    # starts anyway.
+    site_crawl_catalog_timeout_s: int = 10 * 60
     #: Off by default: a crawl seeded at example.com that wanders into
     #: shop.example.com is usually a surprise, not a feature.
     site_crawl_include_subdomains: bool = False

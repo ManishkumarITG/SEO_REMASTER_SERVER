@@ -29,11 +29,13 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_settings
-from db import site_pages
+from db import site_catalog, site_pages
 from exceptions.crawler import FetchError
 from exceptions.stores import RobotsDisallowed
 from models.db import SiteCrawl
 from schemas import (
+    SiteCrawlCatalogItem,
+    SiteCrawlCatalogResponse,
     SiteCrawlCreatedResponse,
     SiteCrawlCreateRequest,
     SiteCrawlIssuesResponse,
@@ -132,6 +134,18 @@ def _status_response(row: SiteCrawl) -> SiteCrawlStatusResponse:
         skipped_page_type=row.skipped_page_type or 0,
         throttled=row.throttled or 0,
         gave_up_throttled=row.gave_up_throttled or 0,
+        throttle_episodes=row.throttle_episodes or 0,
+        throttle_pause_s=row.throttle_pause_s,
+        current_rate_rps=row.current_rate_rps,
+        learned_rate_rps=row.learned_rate_rps,
+        deadline_s=row.deadline_s,
+        catalog_status=row.catalog_status,
+        catalog_products=row.catalog_products,
+        catalog_collections=row.catalog_collections,
+        catalog_requests=row.catalog_requests,
+        catalog_elapsed_s=row.catalog_elapsed_s,
+        catalog_gaps={str(k): int(v) for k, v in (row.catalog_gaps or {}).items()},
+        seeded_from_catalog=row.seeded_from_catalog or 0,
         templates_found=row.templates_found or 0,
         templates_measured=row.templates_measured or 0,
         pages_analyzed=row.pages_analyzed or 0,
@@ -241,6 +255,23 @@ async def _reap_if_abandoned(row: SiteCrawl, session: AsyncSession) -> SiteCrawl
 # --- crawls -------------------------------------------------------------------------
 
 
+async def _in_flight_crawl(session: AsyncSession, host: str) -> SiteCrawl | None:
+    """The newest non-terminal crawl of `host`, if any."""
+    return await session.scalar(
+        select(SiteCrawl)
+        .where(SiteCrawl.host == host, SiteCrawl.status.notin_(_TERMINAL))
+        .order_by(desc(SiteCrawl.created_at))
+        .limit(1)
+    )
+
+
+def _reused(row: SiteCrawl) -> SiteCrawlCreatedResponse:
+    return SiteCrawlCreatedResponse(
+        crawl_id=row.id, start_url=row.start_url, host=row.host,
+        status=row.status, reused=True,  # type: ignore[arg-type]
+    )
+
+
 async def create_site_crawl(
     payload: SiteCrawlCreateRequest,
     background_tasks: BackgroundTasks,
@@ -254,17 +285,11 @@ async def create_site_crawl(
 
     # Duplicate-crawl guard: a double-clicked button must not start a second
     # multi-minute job against the same site. Hand back the one already running.
-    in_flight = await session.scalar(
-        select(SiteCrawl)
-        .where(SiteCrawl.host == host, SiteCrawl.status.notin_(_TERMINAL))
-        .order_by(desc(SiteCrawl.created_at))
-        .limit(1)
-    )
+    # Checked before the probe (cheap, and the common case of the same URL typed
+    # twice) and again after it, below.
+    in_flight = await _in_flight_crawl(session, host)
     if in_flight is not None:
-        return SiteCrawlCreatedResponse(
-            crawl_id=in_flight.id, start_url=in_flight.start_url, host=host,
-            status=in_flight.status, reused=True,  # type: ignore[arg-type]
-        )
+        return _reused(in_flight)
 
     settings = get_settings()
     try:
@@ -274,6 +299,15 @@ async def create_site_crawl(
         raise HTTPException(status_code=403, detail=exc.message) from exc
     except FetchError as exc:
         raise HTTPException(status_code=422, detail=f"Could not reach the site: {exc}") from exc
+
+    # The row stores the host AFTER redirects. Typing `example.com` while a crawl
+    # of `www.example.com` runs only matches once the probe has resolved where the
+    # site really lives, and without this second check that was two crawls
+    # hammering one store at twice the rate it tolerates.
+    if probe.host != host:
+        in_flight = await _in_flight_crawl(session, probe.host)
+        if in_flight is not None:
+            return _reused(in_flight)
 
     options = _requested_options(payload)
     limits = CrawlLimits.from_settings(
@@ -386,6 +420,39 @@ async def get_site_crawl_page(crawl_id: str, url: str, session: AsyncSession) ->
     fields = SiteCrawlPageDetail.model_fields
     known = {k: v for k, v in doc.items() if k in fields and k != "inlinks"}
     return SiteCrawlPageDetail(**known, inlinks=inlinks)
+
+
+async def get_site_crawl_catalog(
+    crawl_id: str,
+    session: AsyncSession,
+    *,
+    kind: str | None = None,
+    gap: str | None = None,
+    offset: int = 0,
+    limit: int = 50,
+) -> SiteCrawlCatalogResponse:
+    """The products and collections a crawl read from the store's JSON, worst first.
+
+    An empty list rather than a 404 for a crawl with no catalog phase: a store
+    that is not on Shopify simply has none, which is an answer, not an error.
+    """
+    row = await _require_crawl(crawl_id, session)
+    try:
+        docs, total = await site_catalog.list_catalog(crawl_id, kind=kind, gap=gap, offset=offset, limit=limit)
+    except PyMongoError as exc:
+        raise _mongo_503(exc) from exc
+    return SiteCrawlCatalogResponse(
+        crawl_id=crawl_id,
+        host=row.host,
+        status=row.catalog_status,
+        products=row.catalog_products or 0,
+        collections=row.catalog_collections or 0,
+        gap_counts={str(k): int(v) for k, v in (row.catalog_gaps or {}).items()},
+        total=total,
+        offset=offset,
+        limit=limit,
+        items=[SiteCrawlCatalogItem.model_validate(doc) for doc in docs],
+    )
 
 
 async def get_site_crawl_templates(

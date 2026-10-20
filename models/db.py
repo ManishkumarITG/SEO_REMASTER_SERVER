@@ -251,6 +251,28 @@ class SiteCrawl(Base):
     #: same reason as the counters above: added after the table existed.
     throttled: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
     gave_up_throttled: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    #: Distinct rate-limit episodes (a burst of 429s is one), the seconds of pause
+    #: they imposed, and the request rate right now. Nullable: added later.
+    throttle_episodes: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    throttle_pause_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    current_rate_rps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: The sustainable rate this host showed us. The next crawl of the same host
+    #: starts here instead of rediscovering it by drawing 429s.
+    learned_rate_rps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: The time limit actually applied, after sizing it to the site.
+    deadline_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: Catalog-first phase (Shopify only): read the whole catalog as JSON before
+    #: fetching pages. NULL status = not a Shopify store, phase not run. The items
+    #: themselves live in MongoDB (db/site_catalog.CATALOG_COLLECTION).
+    catalog_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    catalog_products: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    catalog_collections: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    catalog_requests: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    catalog_elapsed_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    #: {gap: count} over the catalog, e.g. {"image_alt_missing": 412}.
+    catalog_gaps: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    #: Catalog URLs admitted to the frontier (the rest were already queued).
+    seeded_from_catalog: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: Distinct templates seen, and how many got a Lighthouse report. The reports
     #: themselves live in MongoDB (db/site_pages.TEMPLATES_COLLECTION).
     templates_found: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)

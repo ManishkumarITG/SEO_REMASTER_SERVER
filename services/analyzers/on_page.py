@@ -256,7 +256,10 @@ class OnPageAnalyzer(BaseAnalyzer):
                 impact=1, effort=1))
 
         # --- Word count -------------------------------------------------------------------
-        word_count = len(visible_text(dom).split())
+        # The site crawl hands the text over already extracted; a single-page
+        # audit does not, and derives it here as it always has.
+        text = page.visible_text if page.visible_text is not None else visible_text(dom)
+        word_count = len(text.split())
         if word_count < 300:
             add(Finding(
                 id="on_page.word_count", severity=Severity.WARNING,

@@ -48,6 +48,8 @@ from schemas.site_analysis import (
 )
 from schemas.site_crawl import (
     LighthouseReport,
+    SiteCrawlCatalogItem,
+    SiteCrawlCatalogResponse,
     SiteCrawlCreatedResponse,
     SiteCrawlCreateRequest,
     SiteCrawlIssue,
@@ -128,6 +130,8 @@ __all__ = [
     "SiteCrawlStatusResponse",
     "SiteCrawlSummary",
     "SiteCrawlTemplate",
+    "SiteCrawlCatalogItem",
+    "SiteCrawlCatalogResponse",
     "SiteCrawlTemplatesResponse",
     "StoreCatalogItem",
     "StoreCatalogItemDetailResponse",

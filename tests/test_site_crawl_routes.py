@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pymongo.errors import ServerSelectionTimeoutError
 
+import db.site_catalog as site_catalog
 import db.site_pages as site_pages
 import main
 import services.site_crawl_service as service
@@ -444,6 +445,65 @@ async def test_mongo_down_on_templates_answers_503(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(site_pages, "load_template_reports", boom)
     assert _client().get(f"/api/site-crawls/{row.id}/templates").status_code == 503
+
+
+# --- catalog endpoint -----------------------------------------------------------------
+
+
+async def test_the_catalog_endpoint_lists_items_worst_first_with_the_row_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = await _seed_row(status="crawling", catalog_status="complete", catalog_products=2,
+                          catalog_collections=1, catalog_gaps={"image_alt_missing": 2})
+    asked: dict = {}
+
+    async def list_catalog(crawl_id, *, kind, gap, offset, limit):
+        asked.update(crawl_id=crawl_id, kind=kind, gap=gap, offset=offset, limit=limit)
+        return [
+            {"kind": "product", "handle": "bare", "url": "https://s/products/bare", "name": "Bare",
+             "gaps": ["description_missing", "image_alt_missing"], "updated_at": "2026-09-01T10:00:00Z",
+             "price": "18.00", "variants_count": 1},
+        ], 7
+
+    monkeypatch.setattr(site_catalog, "list_catalog", list_catalog)
+    response = _client().get(f"/api/site-crawls/{row.id}/catalog",
+                             params={"kind": "product", "gap": "image_alt_missing", "limit": 20})
+    assert response.status_code == 200
+    body = response.json()
+    assert asked == {"crawl_id": row.id, "kind": "product", "gap": "image_alt_missing", "offset": 0, "limit": 20}
+    assert body["status"] == "complete" and body["products"] == 2 and body["collections"] == 1
+    assert body["gap_counts"] == {"image_alt_missing": 2}
+    assert body["total"] == 7
+    assert body["items"][0]["handle"] == "bare"
+    assert body["items"][0]["gaps"] == ["description_missing", "image_alt_missing"]
+
+
+async def test_a_crawl_without_a_catalog_phase_has_an_empty_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = await _seed_row(status="complete")
+
+    async def empty(crawl_id, **kwargs):
+        return [], 0
+
+    monkeypatch.setattr(site_catalog, "list_catalog", empty)
+    body = _client().get(f"/api/site-crawls/{row.id}/catalog").json()
+    assert body["status"] is None and body["items"] == [] and body["total"] == 0
+
+
+async def test_catalog_filters_are_validated_and_unknown_crawls_are_404() -> None:
+    row = await _seed_row(status="complete")
+    assert _client().get(f"/api/site-crawls/{row.id}/catalog", params={"kind": "page"}).status_code == 422
+    assert _client().get(f"/api/site-crawls/{row.id}/catalog", params={"limit": 501}).status_code == 422
+    assert _client().get(f"/api/site-crawls/{uuid4()}/catalog").status_code == 404
+
+
+async def test_mongo_down_on_catalog_answers_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    row = await _seed_row(status="complete")
+
+    async def boom(crawl_id, **kwargs):
+        raise ServerSelectionTimeoutError("no servers")
+
+    monkeypatch.setattr(site_catalog, "list_catalog", boom)
+    assert _client().get(f"/api/site-crawls/{row.id}/catalog").status_code == 503
 
 
 async def test_the_page_list_carries_the_template_and_heading_counts(

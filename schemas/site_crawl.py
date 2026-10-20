@@ -33,9 +33,11 @@ SiteCrawlIssue = Literal[
 ]
 
 #: Hard ceilings on what one API caller may ask for, independent of the
-#: configured defaults. Above these a crawl stops being a diagnostic and starts
-#: being a load test against a third party.
-MAX_REQUESTABLE_PAGES = 5_000
+#: configured defaults. The page ceiling bounds how LONG a crawl runs, not how
+#: hard it hits the host: the adaptive limiter holds the request rate under what
+#: the host tolerates however many pages are asked for. 25,000 covers a large
+#: store; 0 (no limit) is still allowed and bounded by the deadline.
+MAX_REQUESTABLE_PAGES = 25_000
 MAX_REQUESTABLE_DEPTH = 10
 
 
@@ -133,6 +135,28 @@ class SiteCrawlStatusResponse(BaseModel):
     #: A crawl is never aborted over throttling; these say what it cost.
     throttled: int = 0
     gave_up_throttled: int = 0
+    #: How often the host actually pushed back (a burst of 429s is one episode),
+    #: and the seconds of pause that cost.
+    throttle_episodes: int = 0
+    throttle_pause_s: float | None = None
+    #: The request rate right now, and the sustainable rate this host showed us.
+    current_rate_rps: float | None = None
+    learned_rate_rps: float | None = None
+    #: The time limit actually applied, after sizing it to the site.
+    deadline_s: float | None = None
+
+    #: Catalog-first phase (Shopify stores only; null elsewhere): reading,
+    #: complete, partial or unavailable. The items are on
+    #: GET /api/site-crawls/{id}/catalog.
+    catalog_status: str | None = None
+    catalog_products: int | None = None
+    catalog_collections: int | None = None
+    catalog_requests: int | None = None
+    catalog_elapsed_s: float | None = None
+    #: {gap: count} across the catalog, worst first.
+    catalog_gaps: dict[str, int] = Field(default_factory=dict)
+    #: Catalog URLs the page crawl took on as targets.
+    seeded_from_catalog: int = 0
 
     #: Distinct templates seen, and how many got a Lighthouse report. The reports
     #: are on GET /api/site-crawls/{id}/templates.
@@ -327,6 +351,42 @@ class SiteCrawlTemplatesResponse(BaseModel):
     #: Templates seen versus templates a Lighthouse run was spent on.
     found: int = 0
     measured: int = 0
+
+
+class SiteCrawlCatalogItem(BaseModel):
+    """One product or collection as read from the store's JSON."""
+
+    kind: Literal["product", "collection"]
+    handle: str
+    url: str
+    name: str = ""
+    product_type: str = ""
+    vendor: str = ""
+    description_excerpt: str = ""
+    description_words: int = 0
+    featured_image_url: str = ""
+    featured_image_alt: str = ""
+    products_count: int | None = None
+    variants_count: int = 0
+    price: str | None = None
+    currency: str = ""
+    available: bool | None = None
+    updated_at: datetime | None = None
+    gaps: list[str] = Field(default_factory=list)
+
+
+class SiteCrawlCatalogResponse(BaseModel):
+    crawl_id: str
+    host: str
+    status: str | None = None
+    products: int = 0
+    collections: int = 0
+    gap_counts: dict[str, int] = Field(default_factory=dict)
+    #: Items matching the filter, before paging.
+    total: int = 0
+    offset: int = 0
+    limit: int = 50
+    items: list[SiteCrawlCatalogItem] = Field(default_factory=list)
 
 
 def template_from_doc(doc: dict[str, Any]) -> SiteCrawlTemplate:

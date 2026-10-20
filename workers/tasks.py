@@ -10,6 +10,7 @@ boundary.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -17,10 +18,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import BackgroundTasks, HTTPException
-from sqlalchemy import or_, update
+from sqlalchemy import or_, select, update
 
 from config import get_settings
 from db.session import async_session_factory
+from db.site_catalog import save_catalog as save_site_catalog
 from db.site_pages import mark_orphans, save_pages, save_template_reports
 from db.store_catalog import save_catalog_enrichment, save_catalog_items
 from exceptions.crawler import FetchError
@@ -30,9 +32,11 @@ from services.analyzers.registry import get_analyzers
 from services.crawler.fetcher import fetch_page
 from services.crawler.http_client import crawl_client
 from services.crawler.models import CrawledPage, CrawlLimits, CrawlStats
-from services.crawler.site_crawl import crawl_site, probe_site
+from services.crawler.site_crawl import SiteProbe, crawl_site, limiter_for, probe_site
+from services.crawler.throttle import LocalRateLimiter
 from services.reports.scoring import build_report
 from services.site_crawl_analysis import bulk_analyzers, make_page_hook, parse_analyzer_names
+from services.site_crawl_catalog import collect_site_catalog
 from services.site_crawl_templates import (
     TEMPLATE_PHASE_TIMEOUT_S,
     build_template_reports,
@@ -526,9 +530,9 @@ async def reconcile_orphaned_crawls() -> int:
 
 #: Ceiling on site crawls running at once. One, not two: a site crawl fetches
 #: WHOLE pages (up to 2 MiB each) where the catalog crawl reads only <head>s, and
-#: it runs alongside MAX_CONCURRENT_CRAWLS=2 catalog crawls and 4 audits inside
-#: the same http_client.DEFAULT_LIMITS pool of 24 connections. 1 x 6 workers is
-#: what is left over without starving the endpoints a user is watching.
+#: parsing them runs on the API's own event loop. Each crawl opens its own
+#: connection pool (sized by http_client.DEFAULT_LIMITS); the pools are not
+#: shared, so this limit is about CPU on the event loop, not connections.
 MAX_CONCURRENT_SITE_CRAWLS = 1
 _site_slot = asyncio.Semaphore(MAX_CONCURRENT_SITE_CRAWLS)
 
@@ -539,6 +543,14 @@ SITE_PROBE_TIMEOUT_SECONDS = 30
 #: batch the MongoDB bulk_write and keep the SQLite single writer out of the loop.
 SITE_FLUSH_EVERY_PAGES = 25
 SITE_FLUSH_EVERY_SECONDS = 2.0
+#: Proof of life written on a timer, independent of pages arriving. Progress used
+#: to be flushed only when a page was yielded, so a crawl waiting out a throttle
+#: pause, or measuring templates with Lighthouse for minutes, looked dead to any
+#: other process reading `heartbeat_at`.
+SITE_HEARTBEAT_EVERY_S = 10.0
+#: How far back a previous crawl's learned rate is still trusted. A store's
+#: tolerance changes with its plan and traffic; a month-old answer is a guess.
+LEARNED_RATE_MAX_AGE = timedelta(days=30)
 
 _NON_TERMINAL_SITE_CRAWL = ("pending", "crawling")
 #: A crawl silent for longer than this is presumed dead. Comfortably longer
@@ -612,6 +624,9 @@ def site_page_record(page: CrawledPage, *, crawl_id: str, host: str) -> dict[str
     doc["crawl_id"] = crawl_id
     doc["host"] = host
     doc["orphan"] = False
+    # A real BSON date, not the ISO string `mode="json"` produces, so a crawl's
+    # throughput can be read back per minute with $dateTrunc.
+    doc["fetched_at"] = page.fetched_at
     return doc
 
 
@@ -663,7 +678,15 @@ class _SiteProgress:
                         beyond_depth=stats.beyond_depth,
                         not_attempted=stats.not_attempted,
                         seeded_from_sitemap=stats.seeded_from_sitemap,
+                        seeded_from_catalog=stats.seeded_from_catalog,
                         max_depth_seen=stats.max_depth_seen,
+                        # Live, so the "rate limiting us" banner can appear while
+                        # it is still true rather than only in the final summary.
+                        throttled=stats.throttled,
+                        throttle_episodes=stats.throttle_episodes,
+                        throttle_pause_s=stats.throttle_pause_s,
+                        current_rate_rps=stats.current_rate_rps,
+                        deadline_s=stats.deadline_s or None,
                         # Proof of life, so another process cannot mistake this
                         # crawl for the wreckage of a dead one.
                         heartbeat_at=datetime.now(UTC),
@@ -692,7 +715,32 @@ async def _begin_site_crawl(crawl_id: str) -> tuple[str, CrawlLimits] | None:
         limits = CrawlLimits.from_settings(
             get_settings(), max_pages=row.max_pages, max_depth=row.max_depth, **(row.options or {})
         )
+        limits.known_rate_rps = await _learned_rate_for(session, row.host, exclude_id=row.id)
         return row.start_url, limits
+
+
+async def _learned_rate_for(session: Any, host: str | None, *, exclude_id: str) -> float | None:
+    """The most recent sustainable rate a crawl of `host` learned, if fresh enough.
+
+    Starting from it is what makes a re-crawl fast from its first request: the
+    alternative is drawing 429s from the store again to rediscover a number we
+    already had.
+    """
+    if not host:
+        return None
+    since = datetime.now(UTC) - LEARNED_RATE_MAX_AGE
+    rate = await session.scalar(
+        select(SiteCrawl.learned_rate_rps)
+        .where(
+            SiteCrawl.host == host,
+            SiteCrawl.id != exclude_id,
+            SiteCrawl.learned_rate_rps.is_not(None),
+            SiteCrawl.completed_at >= since,
+        )
+        .order_by(SiteCrawl.completed_at.desc())
+        .limit(1)
+    )
+    return float(rate) if rate else None
 
 
 async def _record_site_probe(crawl_id: str, *, start_url: str, host: str, site_name: str) -> None:
@@ -704,6 +752,75 @@ async def _record_site_probe(crawl_id: str, *, start_url: str, host: str, site_n
             .values(start_url=start_url, host=host, site_name=site_name[:255] or None)
         )
         await session.commit()
+
+
+async def _record_catalog(crawl_id: str, **values: Any) -> None:
+    """Write catalog-phase columns. Cosmetic like progress: logs, never raises."""
+    try:
+        async with async_session_factory() as session:
+            await session.execute(update(SiteCrawl).where(SiteCrawl.id == crawl_id).values(**values))
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Site crawl %s: catalog status write failed: %s", crawl_id, exc)
+
+
+async def _run_catalog_phase(
+    crawl_id: str,
+    client: Any,
+    probe: SiteProbe,
+    limiter: LocalRateLimiter,
+    settings: Any,
+    stats: CrawlStats,
+) -> list[str]:
+    """Read a Shopify store's whole catalog as JSON before any page. -> URLs to seed.
+
+    The fastest complete answer this tool can give about a large store: every
+    product and collection in ~1 request per 250, so the catalog's findings are on
+    the row within about a minute while the page crawl is still to come. It never
+    fails the crawl - a store whose JSON is closed, blocked or broken is simply
+    crawled from its sitemap as before, with a note saying so.
+    """
+    await _record_catalog(crawl_id, catalog_status="reading")
+    started = time.monotonic()
+    timeout = float(settings.site_crawl_catalog_timeout_s)
+
+    def stop_reading() -> bool:
+        return crawl_id in _stop_requested or time.monotonic() - started >= timeout
+
+    try:
+        catalog = await collect_site_catalog(
+            client, probe, crawl_id=crawl_id, limiter=limiter, should_stop=stop_reading,
+            max_products=settings.site_crawl_catalog_max_products,
+            max_collections=settings.site_crawl_catalog_max_collections,
+        )
+    except Exception as exc:  # noqa: BLE001 - the catalog is a head start, never a requirement
+        logger.warning("Site crawl %s: catalog phase failed: %s: %s", crawl_id, type(exc).__name__, exc)
+        await _record_catalog(crawl_id, catalog_status="unavailable")
+        stats.note("the store's product catalog could not be read; crawling from its sitemap instead")
+        return []
+
+    if not catalog.complete and time.monotonic() - started >= timeout:
+        catalog.notes.append(f"the catalog read stopped at its {timeout / 60:.0f}-minute limit")
+    for note in catalog.notes:
+        stats.note(note)
+    if catalog.records and await save_site_catalog(catalog.records) <= 0:
+        stats.note("the catalog was read but could not be saved, because MongoDB was unreachable")
+    summary = catalog.summary()
+    await _record_catalog(
+        crawl_id,
+        catalog_status=summary["status"],
+        catalog_products=catalog.products,
+        catalog_collections=catalog.collections,
+        catalog_requests=catalog.requests,
+        catalog_elapsed_s=summary["elapsed_s"],
+        catalog_gaps=summary["gap_counts"],
+    )
+    if catalog.status != "unavailable":
+        stats.note(
+            f"read {catalog.products:,} products and {catalog.collections:,} collections from the "
+            f"store's catalog in {summary['elapsed_s']:.0f}s ({catalog.requests} requests)"
+        )
+    return catalog.urls
 
 
 def _site_terminal_status(stats: CrawlStats) -> str:
@@ -754,12 +871,18 @@ async def _finish_site_crawl(
                 beyond_depth=stats.beyond_depth,
                 not_attempted=stats.not_attempted,
                 seeded_from_sitemap=stats.seeded_from_sitemap,
+                seeded_from_catalog=stats.seeded_from_catalog,
                 max_depth_seen=stats.max_depth_seen,
                 target_pages=stats.targets,
                 navigation_pages=stats.navigation_pages,
                 skipped_page_type=stats.skipped_page_type,
                 throttled=stats.throttled,
                 gave_up_throttled=stats.gave_up_throttled,
+                throttle_episodes=stats.throttle_episodes,
+                throttle_pause_s=stats.throttle_pause_s,
+                current_rate_rps=stats.current_rate_rps,
+                learned_rate_rps=stats.learned_rate_rps,
+                deadline_s=stats.deadline_s or None,
                 templates_found=templates_found,
                 templates_measured=templates_measured,
                 pages_analyzed=stats.analyzed,
@@ -839,9 +962,40 @@ async def _mark_site_crawl_failed(crawl_id: str, message: str) -> None:
         logger.exception("Site crawl %s: could not even record the failure", crawl_id)
 
 
+class _Heartbeat:
+    """Flushes a crawl's progress on a timer for as long as the crawl runs.
+
+    Entered with the crawl slot and started once the progress object exists, so
+    every exit path - success, failure, an early return - stops it. Writes are the
+    same absolute values `_SiteProgress` already writes, so a beat that lands
+    beside a page-driven flush is harmless.
+    """
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self, progress: _SiteProgress) -> None:
+        self._task = asyncio.create_task(self._beat(progress), name=f"site-crawl-heartbeat:{progress.crawl_id}")
+
+    @staticmethod
+    async def _beat(progress: _SiteProgress) -> None:
+        while True:
+            await asyncio.sleep(SITE_HEARTBEAT_EVERY_S)
+            await progress.flush()
+
+    async def __aenter__(self) -> _Heartbeat:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+
+
 async def run_site_crawl(crawl_id: str) -> None:
     """Crawl one site end to end, streaming pages into MongoDB as they arrive."""
-    async with _site_slot:
+    async with _site_slot, _Heartbeat() as heartbeat:
         begun = await _begin_site_crawl(crawl_id)
         if begun is None:
             logger.error("Site crawl %s not found", crawl_id)
@@ -854,6 +1008,7 @@ async def run_site_crawl(crawl_id: str) -> None:
 
         stats = CrawlStats()
         progress = _SiteProgress(crawl_id, stats)
+        heartbeat.start(progress)
         buffer: list[dict[str, Any]] = []
         persisted = 0
         persistence_ok = True
@@ -894,8 +1049,18 @@ async def run_site_crawl(crawl_id: str) -> None:
                     ", ".join(a.name for a in analyzers) or "none",
                 )
 
+                # One limiter for everything this crawl sends to the host, built
+                # here so the catalog phase and the page crawl share it: the store
+                # sees one paced client, and the pages start from what the catalog
+                # read learned about its tolerance.
+                limiter = limiter_for(probe.robots, limits)
+                catalog_seeds: list[str] = []
+                if probe.is_shopify and settings.site_crawl_catalog_first:
+                    catalog_seeds = await _run_catalog_phase(crawl_id, client, probe, limiter, settings, stats)
+
                 async for page in crawl_site(
                     client, probe.start_url, robots=probe.robots, limits=limits, stats=stats,
+                    limiter=limiter, extra_seeds=catalog_seeds,
                     page_hook=make_page_hook(analyzers, stats) if analyzers else None,
                     should_stop=lambda: crawl_id in _stop_requested,
                 ):
@@ -964,9 +1129,12 @@ async def run_site_crawl(crawl_id: str) -> None:
             templates_found=templates_found, templates_measured=templates_measured,
         )
         logger.info(
-            "Site crawl %s %s: %d target pages (%d navigation), avg score %s, %d orphans, %.1fs",
+            "Site crawl %s %s: %d target pages (%d navigation), avg score %s, %d orphans, %.1fs, "
+            "%.2f pages/s, %d throttle episodes (%d responses, %.0fs paused), learned %s req/s",
             crawl_id, status, stats.targets, stats.navigation_pages,
             stats.average_score, len(orphans), stats.elapsed_s,
+            stats.pages_per_second, stats.throttle_episodes, stats.throttled,
+            stats.throttle_pause_s, stats.learned_rate_rps,
         )
 
 

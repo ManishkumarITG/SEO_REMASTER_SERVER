@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
+import math
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlsplit
@@ -33,6 +35,7 @@ import httpx
 from exceptions.crawler import FetchError
 from exceptions.stores import CatalogUnavailable, RobotsDisallowed
 from services.crawler.http_client import (
+    JsonResult,
     fetch_robots,
     get_json,
     get_text,
@@ -41,7 +44,8 @@ from services.crawler.http_client import (
 )
 from services.crawler.parser import text_from_html_fragment
 from services.crawler.robots import RobotsRules
-from services.crawler.sitemap import parse_sitemap_locs
+from services.crawler.sitemap import is_locale_sitemap, parse_sitemap_locs
+from services.crawler.throttle import LocalRateLimiter, Signal
 from services.crawler.urls import classify_catalog_url, handle_ok
 from services.stores.models import CatalogItem, DiscoveryResult, OriginInfo, ProbeResult
 
@@ -50,6 +54,9 @@ logger = logging.getLogger("seo.stores.discovery")
 SHOPIFY_PAGE_LIMIT = 250
 #: Restart limit after a page exceeded the byte cap.
 FALLBACK_PAGE_LIMIT = 50
+#: A paced walk asks for a throttled page again this many times before it gives
+#: the catalog up as incomplete. Same patience as the page crawl.
+MAX_JSON_THROTTLE_RETRIES = 4
 MAX_PRODUCT_PAGES = 40  # 40 x 250 = 10,000
 MAX_COLLECTION_PAGES = 8
 MAX_PRODUCTS = 10_000
@@ -58,10 +65,6 @@ MAX_SUB_SITEMAPS = 20
 DESCRIPTION_CHARS = 2_000
 #: Only status matters for the probe; read a sliver.
 PROBE_BYTES = 16 * 1024
-
-#: A path segment like "es-US" or "fr" before "sitemap_" marks a locale duplicate.
-_LOCALE_SEGMENT_RE = re.compile(r"^[a-z]{2}(?:-[A-Za-z]{2})?$")
-
 
 # --- probe (synchronous, in the POST) ----------------------------------------------
 
@@ -114,6 +117,122 @@ def _non_ok_status(status: int | None) -> int | None:
 # --- tier 1: Shopify JSON -------------------------------------------------------------
 
 
+@dataclass(slots=True)
+class _Walk:
+    """One paginated walk of a Shopify JSON endpoint."""
+
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    pages: int = 0
+    requests: int = 0
+    notes: list[str] = field(default_factory=list)
+    hit_cap: bool = False
+    truncated: bool = False
+    #: True only when the walk ended the way a full catalog ends: a short or
+    #: empty page. A cap, a byte overflow, a refusal or a stop all leave it False,
+    #: so "we read 4,000 products" is never mistaken for "the store has 4,000".
+    complete: bool = False
+    #: The host answered 401/403: a bot wall. Not retried, and reported.
+    blocked: bool = False
+
+
+def _json_signal(result: JsonResult) -> Signal:
+    if result.error and result.status_code is None:
+        return Signal.NEUTRAL  # transport failure: says nothing about our rate
+    if result.status_code in (429, 503):
+        return Signal.THROTTLE
+    if result.status_code in (401, 403):
+        return Signal.SEVERE
+    return Signal.OK
+
+
+async def _walk(
+    client: httpx.AsyncClient,
+    origin: str,
+    path: str,
+    key: str,
+    *,
+    limit: int,
+    max_items: int,
+    max_pages: int,
+    pacer: LocalRateLimiter | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> _Walk:
+    """Walk ?limit=&page= until a short/empty page.
+
+    With a `pacer`, every request waits for its slot from the crawl's rate
+    limiter and reports what came back, and a 429/503 is asked again instead of
+    ending the walk. Without one this behaves exactly as the catalog crawl always
+    has - which is also how a single 429 used to cut a catalog short in silence.
+    """
+    walk = _Walk()
+    seen_ids: set[Any] = set()
+    previous_first: Any = object()
+    for page in range(1, max_pages + 1):
+        attempts = 0
+        while True:
+            ticket = None
+            if pacer is not None:
+                ticket = await pacer.acquire(should_stop)
+                if ticket is None:
+                    walk.notes.append(f"{path} stopped at page {page} before the end of the catalog")
+                    return walk
+            result = await get_json(client, f"{origin}{path}", params={"limit": limit, "page": page})
+            walk.requests += 1
+            if pacer is not None and ticket is not None:
+                pacer.report(ticket, _json_signal(result))
+            retryable = result.status_code in (429, 503) or (result.error and result.status_code is None)
+            if pacer is not None and retryable and attempts < MAX_JSON_THROTTLE_RETRIES:
+                attempts += 1
+                continue
+            break
+        if result.truncated:
+            walk.truncated = True
+            return walk
+        if not result.ok or not isinstance(result.payload, dict):
+            if result.status_code in (401, 403):
+                walk.blocked = True
+            if walk.pages == 0:
+                if result.status_code not in (None, 200):
+                    walk.notes.append(f"{path} answered {result.status_code}")
+            elif pacer is not None:
+                # Mid-walk failure: say so, rather than let a partial catalog pass
+                # as the whole store.
+                walk.notes.append(
+                    f"{path} failed at page {page} (HTTP {result.status_code or 'error'}); "
+                    f"catalog is incomplete after {len(walk.rows)} items"
+                )
+            return walk
+        batch = result.payload.get(key)
+        if not isinstance(batch, list) or not batch:
+            walk.complete = True
+            return walk
+        walk.pages += 1
+        first_id = batch[0].get("id") if isinstance(batch[0], dict) else None
+        if first_id is not None and first_id == previous_first:
+            # A proxy is stripping ?page= - without this guard we would ingest
+            # page 1 forty times.
+            walk.notes.append(f"{path} ignores the page parameter; stopped after page {page - 1}")
+            return walk
+        previous_first = first_id
+        for raw in batch:
+            if not isinstance(raw, dict):
+                continue
+            item_id = raw.get("id")
+            if item_id is not None:
+                if item_id in seen_ids:
+                    continue
+                seen_ids.add(item_id)
+            walk.rows.append(raw)
+            if len(walk.rows) >= max_items:
+                walk.hit_cap = True
+                return walk
+        if len(batch) < limit:
+            walk.complete = True
+            return walk
+    walk.notes.append(f"{path} stopped at the {max_pages}-page cap")
+    return walk
+
+
 async def _paginate(
     client: httpx.AsyncClient,
     origin: str,
@@ -125,44 +244,9 @@ async def _paginate(
     max_pages: int,
 ) -> tuple[list[dict[str, Any]], int, list[str], bool, bool]:
     """Walk ?limit=&page= until a short/empty page. -> (rows, pages, notes, hit_cap, truncated)."""
-    rows: list[dict[str, Any]] = []
-    seen_ids: set[Any] = set()
-    notes: list[str] = []
-    previous_first: Any = object()
-    pages = 0
-    for page in range(1, max_pages + 1):
-        result = await get_json(client, f"{origin}{path}", params={"limit": limit, "page": page})
-        if result.truncated:
-            return rows, pages, notes, False, True
-        if not result.ok or not isinstance(result.payload, dict):
-            if pages == 0 and result.status_code not in (None, 200):
-                notes.append(f"{path} answered {result.status_code}")
-            break
-        batch = result.payload.get(key)
-        if not isinstance(batch, list) or not batch:
-            break
-        pages += 1
-        first_id = batch[0].get("id") if isinstance(batch[0], dict) else None
-        if first_id is not None and first_id == previous_first:
-            # A proxy is stripping ?page= - without this guard we would ingest
-            # page 1 forty times.
-            notes.append(f"{path} ignores the page parameter; stopped after page {page - 1}")
-            break
-        previous_first = first_id
-        for raw in batch:
-            if not isinstance(raw, dict):
-                continue
-            item_id = raw.get("id")
-            if item_id is not None:
-                if item_id in seen_ids:
-                    continue
-                seen_ids.add(item_id)
-            rows.append(raw)
-            if len(rows) >= max_items:
-                return rows, pages, notes, True, False
-        if len(batch) < limit:
-            break
-    return rows, pages, notes, False, False
+    walk = await _walk(client, origin, path, key, limit=limit, max_items=max_items, max_pages=max_pages)
+    notes = [n for n in walk.notes if "-page cap" not in n]  # the unpaced crawl never said this
+    return walk.rows, walk.pages, notes, walk.hit_cap, walk.truncated
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -280,6 +364,96 @@ async def _discover_json(
     return rows, pages, notes, hit_cap
 
 
+@dataclass(slots=True)
+class CatalogJson:
+    """The whole catalog as read from Shopify's JSON, for the site crawl."""
+
+    products: list[CatalogItem] = field(default_factory=list)
+    collections: list[CatalogItem] = field(default_factory=list)
+    #: Each endpoint was walked to its natural end. Only then is a count a
+    #: statement about the store rather than about how far we got.
+    products_complete: bool = False
+    collections_complete: bool = False
+    requests: int = 0
+    blocked: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+async def _read_endpoint(
+    client: httpx.AsyncClient,
+    origin: str,
+    path: str,
+    key: str,
+    *,
+    max_items: int,
+    pacer: LocalRateLimiter,
+    should_stop: Callable[[], bool] | None,
+) -> _Walk:
+    """One endpoint, restarting once at a smaller page size if a page overflowed."""
+    max_pages = math.ceil(max_items / SHOPIFY_PAGE_LIMIT) + 1
+    walk = await _walk(client, origin, path, key, limit=SHOPIFY_PAGE_LIMIT, max_items=max_items,
+                       max_pages=max_pages, pacer=pacer, should_stop=should_stop)
+    if walk.truncated:
+        first_requests = walk.requests
+        walk = await _walk(client, origin, path, key, limit=FALLBACK_PAGE_LIMIT, max_items=max_items,
+                           max_pages=max_pages * (SHOPIFY_PAGE_LIMIT // FALLBACK_PAGE_LIMIT),
+                           pacer=pacer, should_stop=should_stop)
+        walk.requests += first_requests
+        walk.notes.insert(0, f"{path} page exceeded the byte cap at limit={SHOPIFY_PAGE_LIMIT}; "
+                             f"read at limit={FALLBACK_PAGE_LIMIT} instead")
+    return walk
+
+
+async def fetch_catalog_json(
+    client: httpx.AsyncClient,
+    origin: str,
+    robots: RobotsRules,
+    *,
+    pacer: LocalRateLimiter,
+    should_stop: Callable[[], bool] | None = None,
+    max_products: int = 50_000,
+    max_collections: int = 5_000,
+    currency: str = "",
+) -> CatalogJson:
+    """Every product and collection of a Shopify store, from its public JSON.
+
+    250 items a request, so a 20,000-product store is ~80 requests where the
+    pages themselves would be 20,000. Every request goes through `pacer`, the
+    SAME rate limiter the page crawl then uses, so the store sees one paced
+    client and the crawl starts from whatever this phase learned about it.
+
+    robots.txt is honoured per endpoint: a store that disallows /products.json
+    gets no JSON read, and its products come from the sitemap instead.
+    """
+    out = CatalogJson()
+    plan = (
+        ("/products.json", "products", max_products),
+        ("/collections.json", "collections", max_collections),
+    )
+    for path, key, cap in plan:
+        if not robots.allows(path):
+            out.notes.append(f"robots.txt disallows {path}; using the sitemap instead")
+            continue
+        walk = await _read_endpoint(client, origin, path, key, max_items=cap, pacer=pacer,
+                                    should_stop=should_stop)
+        out.requests += walk.requests
+        out.notes += walk.notes
+        out.blocked = out.blocked or walk.blocked
+        if walk.hit_cap:
+            out.notes.append(f"{path} stopped at the {cap:,}-item cap")
+        if key == "products":
+            out.products = [i for i in (product_from_json(origin, r, currency=currency) for r in walk.rows) if i]
+            out.products_complete = walk.complete
+        else:
+            out.collections = [i for i in (collection_from_json(origin, r) for r in walk.rows) if i]
+            out.collections_complete = walk.complete
+        if walk.blocked:
+            # A bot wall on one endpoint is a bot wall on the next; do not knock twice.
+            out.notes.append(f"{path} was refused (HTTP 401/403); stopped reading the catalog")
+            break
+    return out
+
+
 # --- tier 2: sitemap ---------------------------------------------------------------------
 
 
@@ -287,9 +461,9 @@ def _same_host(origin: str, url: str) -> bool:
     return (urlsplit(url).hostname or "").lower() == (urlsplit(origin).hostname or "").lower()
 
 
-def _is_locale_sitemap(url: str) -> bool:
-    segments = [s for s in urlsplit(url).path.split("/") if s]
-    return len(segments) >= 2 and bool(_LOCALE_SEGMENT_RE.match(segments[0])) and "sitemap" in segments[-1].lower()
+#: Kept under its old private name for existing callers; the definition moved down
+#: into the crawler layer so the site crawl can use it without importing upward.
+_is_locale_sitemap = is_locale_sitemap
 
 
 def item_from_url(kind: str, url: str) -> CatalogItem:

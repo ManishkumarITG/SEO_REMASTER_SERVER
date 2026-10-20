@@ -62,9 +62,11 @@ from services.crawler.http_client import (
     resolve_origin,
 )
 from services.crawler.models import CrawledPage, CrawlLimits, CrawlStats, SiteCrawlResult
+from services.crawler.outcomes import detect_challenge
 from services.crawler.parser import (
     PageData,
     extract_main_text,
+    extract_texts,
     first_attr,
     first_text,
     link_by_rel,
@@ -73,9 +75,9 @@ from services.crawler.parser import (
     visible_text,
 )
 from services.crawler.robots import RobotsRules
-from services.crawler.sitemap import is_sitemap_url, looks_like_sitemap, parse_sitemap_locs
+from services.crawler.sitemap import is_locale_sitemap, is_sitemap_url, looks_like_sitemap, parse_sitemap_locs
 from services.crawler.templates import detect_template
-from services.crawler.throttle import HostGate
+from services.crawler.throttle import HostGate, LocalRateLimiter, Signal, Ticket, parse_retry_after
 from services.crawler.urls import (
     classify_catalog_url,
     extract_links,
@@ -102,20 +104,22 @@ RETRY_DELAY_S = 0.5
 #: SAME page do we accept that we cannot get it, and even then the crawl
 #: continues with the rest.
 MAX_THROTTLE_RETRIES = 4
-#: Ceiling on the pause between requests once a host is throttling us. Far above
-#: the catalog crawl 2 s, because waiting 30 s and finishing beats giving up:
-#: the deadline is what bounds the crawl, not our patience.
+#: Ceiling on the host-wide pause after a throttle episode. The deadline, not our
+#: patience, is what bounds a crawl; this only stops one bad minute becoming a
+#: bad hour.
 THROTTLED_MAX_INTERVAL_S = 30.0
 #: Longest single sleep honoured from a Retry-After header. A host asking for ten
 #: minutes gets the deadline instead.
 MAX_RETRY_AFTER_S = 60.0
-#: Sitemap documents read while seeding, index files included.
-MAX_SITEMAP_FETCHES = 10
+#: Sitemap documents read while seeding, index files included. Shopify splits a
+#: large catalog across many child sitemaps; at 10 a 20,000-product store stopped
+#: seeding at 8,001 URLs and most of the site was never a target.
+MAX_SITEMAP_FETCHES = 50
 #: URLs taken from the sitemaps when the crawl has NO page limit. Without this a
 #: limit derived from `max_pages` collapses to a token number the moment the page
 #: cap is switched off, which is the opposite of what "all pages" asks for. It is
 #: still a cap, because a sitemap is a document a third party controls.
-MAX_SITEMAP_SEEDS = 25_000
+MAX_SITEMAP_SEEDS = 50_000
 #: Skipped URLs are reported individually up to this many, then only counted. A
 #: `Disallow: /search` on a faceted store can match tens of thousands of URLs and
 #: the finding is "robots blocks your search pages", not a list of them.
@@ -205,12 +209,22 @@ def extract_page_facts(
     *,
     url: str = "",
     text_chars: int = 0,
+    texts: tuple[str, str] | None = None,
 ) -> dict[str, object]:
     """Reduce a parsed page to the facts a report needs, then let the markup go.
 
     Returns a plain dict rather than a model so `CrawledPage` stays the only
     place that decides which facts are persisted.
+
+    `texts` is (visible, main) from `parser.extract_texts`, when the caller has
+    already paid for it once. Without it the text is derived from `dom` the old
+    way, which re-serializes and re-parses the document twice.
     """
+    if texts is None:
+        visible = visible_text(dom)
+        main = extract_main_text(dom, max_chars=text_chars) if text_chars > 0 else ""
+    else:
+        visible, main = texts
     raw_robots, noindex, nofollow = robots_directives(dom, headers or {})
     h1_nodes = dom.css("h1")
     images = dom.css("img")
@@ -231,7 +245,7 @@ def extract_page_facts(
         "h1": [" ".join((node.text() or "").split()) for node in h1_nodes[:MAX_H1_KEPT]],
         "h1_count": len(h1_nodes),
         "h2_count": len(dom.css("h2")),
-        "word_count": len(visible_text(dom).split()),
+        "word_count": len(visible.split()),
         "images": len(images),
         "images_missing_alt": missing_alt,
         # The full outline, not just the H1/H2 tallies above.
@@ -243,7 +257,7 @@ def extract_page_facts(
         # Main body text with nav/footer/header chrome stripped, capped. Empty
         # when text storage is off: the markup itself is never kept, so this is
         # the only record of what the page actually said.
-        "text_content": extract_main_text(dom, max_chars=text_chars) if text_chars > 0 else "",
+        "text_content": main if text_chars > 0 else "",
     }
 
 
@@ -279,6 +293,12 @@ class SiteProbe:
     site_name: str = ""
     status_code: int | None = None
     redirect_chain: list[str] = field(default_factory=list)
+    #: The homepage carries Shopify's markers. Read from the probe's own GET, so
+    #: knowing it costs no request; it decides whether the crawl reads the
+    #: product catalog as JSON before fetching any page.
+    is_shopify: bool = False
+    #: og:price:currency from the same homepage read, for catalog prices.
+    currency: str = ""
 
 
 async def probe_site(client: httpx.AsyncClient, start_url: str) -> SiteProbe:
@@ -319,6 +339,8 @@ async def probe_site(client: httpx.AsyncClient, start_url: str) -> SiteProbe:
         site_name=info.site_name,
         status_code=info.status_code,
         redirect_chain=list(info.redirect_chain),
+        is_shopify=info.is_shopify,
+        currency=info.currency,
     )
 
 
@@ -333,7 +355,7 @@ async def sitemap_seed_urls(
     host: str,
     include_subdomains: bool = False,
     limit: int = 5_000,
-    gate: HostGate | None = None,
+    gate: HostGate | LocalRateLimiter | None = None,
 ) -> tuple[list[str], list[str]]:
     """Same-site page URLs listed in the sitemaps. -> (urls, notes).
 
@@ -349,6 +371,7 @@ async def sitemap_seed_urls(
     seen_urls: set[str] = set()
     pending = candidates
     fetches = 0
+    locale_skipped = 0
 
     for depth in (0, 1):
         next_pending: list[str] = []
@@ -383,6 +406,11 @@ async def sitemap_seed_urls(
                 if not same_site(normalized, host, include_subdomains=include_subdomains):
                     continue
                 if is_sitemap_url(normalized):
+                    if is_locale_sitemap(normalized):
+                        # A translated copy of the catalogue: same pages under
+                        # /fr/, /de/... Counted once, never seeded.
+                        locale_skipped += 1
+                        continue
                     if depth == 0:
                         next_pending.append(normalized)
                     continue
@@ -396,10 +424,30 @@ async def sitemap_seed_urls(
         pending = next_pending
         if not pending:
             break
+    if locale_skipped:
+        notes.append(f"skipped {locale_skipped} translated (locale) sitemap{'s' if locale_skipped != 1 else ''}")
     return found, notes
 
 
 # --- the crawl --------------------------------------------------------------------
+
+
+def limiter_for(robots: RobotsRules, limits: CrawlLimits) -> LocalRateLimiter:
+    """The rate limiter one crawl of one host uses, from its robots and limits.
+
+    Public so a caller can build it BEFORE the crawl and share it with work that
+    runs first against the same host - the Shopify catalog read - so the store
+    sees one paced client and the page crawl starts from what that phase learned.
+    """
+    return LocalRateLimiter.for_robots(
+        robots,
+        floor_s=limits.min_interval_s,
+        initial_rate=limits.initial_rate_rps,
+        slow_start=limits.slow_start,
+        known_rate=limits.known_rate_rps,
+        pause_max_s=THROTTLED_MAX_INTERVAL_S,
+        retry_after_max_s=MAX_RETRY_AFTER_S,
+    )
 
 
 async def crawl_site(
@@ -408,7 +456,7 @@ async def crawl_site(
     *,
     robots: RobotsRules | None = None,
     limits: CrawlLimits | None = None,
-    gate: HostGate | None = None,
+    limiter: LocalRateLimiter | None = None,
     stats: CrawlStats | None = None,
     extra_seeds: Sequence[str] = (),
     page_hook: PageHook | None = None,
@@ -441,9 +489,7 @@ async def crawl_site(
     origin = origin_of(start)
     if robots is None:
         robots = await fetch_robots(client, origin)
-    gate = gate or HostGate.for_robots(
-        robots, floor_s=limits.min_interval_s, max_interval_s=THROTTLED_MAX_INTERVAL_S
-    )
+    limiter = limiter or limiter_for(robots, limits)
 
     #: (url, depth, discovered_from, is_target). `is_target` is False for a page
     #: fetched only to reach the ones the caller asked for.
@@ -452,10 +498,47 @@ async def crawl_site(
     seen: set[str] = set()
     deep_seen: set[str] = set()
     started = time.monotonic()
+    #: Sized to the site once the sitemap has been read; see below.
+    deadline_s = limits.deadline_s
+    stats.deadline_s = deadline_s
     reserved = 0
     navigation_reserved = 0
     stopping = False
     skip_records = 0
+
+    def must_stop() -> bool:
+        """True once the crawl should start nothing more, recording why."""
+        return stopping or interrupted()
+
+    def interrupted() -> bool:
+        """True when a person pressed Stop or the deadline passed, recording which.
+
+        These two - and only these - may cut off a page that is already waiting
+        for its turn at the limiter, so they land within one poll instead of
+        after however long a back-off happened to be. Running out of page budget
+        is deliberately NOT one of them: a page that reserved its slot before the
+        budget ran out is part of the budget and must still be fetched, or
+        `max_pages=N` would quietly deliver fewer than N.
+        """
+        nonlocal stopping
+        if stats.stopped_by_user or stats.deadline_hit:
+            return True
+        if should_stop is not None and should_stop():
+            # The only interruption a person asked for. Everything fetched so far
+            # is kept; the crawl simply stops asking for more.
+            stopping = True
+            stats.stopped_by_user = True
+            stats.aborted_reason = stats.aborted_reason or "stopped by user"
+            return True
+        # `>=`, not `>`: a deadline of 0 must mean "no time at all", and
+        # time.monotonic() has ~16 ms granularity on Windows, so a strict
+        # comparison lets the first page through before the clock has ticked.
+        if time.monotonic() - started >= deadline_s:
+            stopping = True
+            stats.deadline_hit = True
+            stats.aborted_reason = stats.aborted_reason or "deadline"
+            return True
+        return False
 
     def emit(page: CrawledPage) -> None:
         results.put_nowait(page)
@@ -525,8 +608,10 @@ async def crawl_site(
     if not seed_admitted and not robots.allows(robots_target(start)):
         stats.note("the start URL is disallowed by robots.txt")
 
-    for seed in extra_seeds:
-        enqueue(seed, 0, "")
+    # Extra seeds are the store's own catalog (product and collection URLs read
+    # from its JSON). Queued before the sitemap, so each catalog page is credited
+    # to the catalog and the sitemap seeding below skips it as already seen.
+    stats.seeded_from_catalog = sum(1 for seed in extra_seeds if enqueue(seed, 0, "catalog"))
 
     if limits.seed_from_sitemap:
         seeds, notes = await sitemap_seed_urls(
@@ -536,34 +621,29 @@ async def crawl_site(
             # redirect or 404 - or everything the sitemap offers when there is no
             # budget to derive it from.
             limit=(max(limits.max_pages * 2, 100) if limits.max_pages else MAX_SITEMAP_SEEDS),
-            gate=gate,
+            gate=limiter,
         )
         for note in notes:
             stats.note(note)
         admitted = sum(1 for seed in seeds if enqueue(seed, 0, "sitemap"))
         stats.seeded_from_sitemap = admitted
 
+    # Only now is the size of the job known. A fixed 30-minute deadline sized for
+    # a 500-page crawl cut an 8,000-page store off at 701 pages.
+    sized = limits.effective_deadline_s(stats.discovered)
+    if sized > deadline_s:
+        deadline_s = sized
+        # The pages the deadline was sized FOR: the frontier, or the budget when
+        # that is smaller - not everything the sitemap listed.
+        budget = limits.page_budget
+        expected = min(stats.discovered, budget) if budget is not None else stats.discovered
+        stats.note(f"time limit raised to {_minutes(deadline_s)} for {expected:,} pages")
+    stats.deadline_s = deadline_s
+
     async def handle(url: str, depth: int, source: str, is_target: bool) -> None:
         nonlocal reserved, navigation_reserved, stopping
 
-        if stopping:
-            stats.not_attempted += 1
-            return
-        if should_stop is not None and should_stop():
-            # The only interruption a person asked for. Everything fetched so far
-            # is kept; the crawl simply stops asking for more.
-            stopping = True
-            stats.stopped_by_user = True
-            stats.aborted_reason = stats.aborted_reason or "stopped by user"
-            stats.not_attempted += 1
-            return
-        # `>=`, not `>`: a deadline of 0 must mean "no time at all", and
-        # time.monotonic() has ~16 ms granularity on Windows, so a strict
-        # comparison lets the first page through before the clock has ticked.
-        if time.monotonic() - started >= limits.deadline_s:
-            stopping = True
-            stats.deadline_hit = True
-            stats.aborted_reason = stats.aborted_reason or "deadline"
+        if must_stop():
             stats.not_attempted += 1
             return
         if is_target:
@@ -587,11 +667,16 @@ async def crawl_site(
                 return
             navigation_reserved += 1
 
-        page = await _fetch_page(client, url, depth, source, gate=gate, stats=stats,
+        page = await _fetch_page(client, url, depth, source, limiter=limiter, stats=stats,
                                  limits=limits, host=host, robots=robots,
                                  # A page nobody asked for is not worth scoring.
                                  page_hook=page_hook if is_target else None,
-                                 is_target=is_target)
+                                 is_target=is_target, interrupt=interrupted)
+        if page is None:
+            # Stop or the deadline arrived while this page waited for its turn.
+            # It was never requested, which is exactly what not_attempted means.
+            stats.not_attempted += 1
+            return
         emit(page)
         if page.fetched:
             if is_target:
@@ -645,6 +730,40 @@ async def crawl_site(
             task.cancel()
         closer_task.cancel()
         stats.elapsed_s = round(time.monotonic() - started, 2)
+        _sync_limiter_stats(limiter, stats)
+        stats.learned_rate_rps = limiter.state.learned_rps
+
+
+def _minutes(seconds: float) -> str:
+    """"2h 13m" / "45m" for a note a person reads."""
+    total = int(round(seconds / 60))
+    hours, minutes = divmod(total, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+def _sync_limiter_stats(limiter: LocalRateLimiter, stats: CrawlStats) -> None:
+    state = limiter.state
+    stats.throttle_episodes = state.episodes
+    stats.throttle_pause_s = round(state.pause_total_s, 1)
+    stats.current_rate_rps = round(state.rate, 2)
+
+
+def _signal_for(result: Any) -> Signal:
+    """What one response says about our request rate."""
+    if result.error:
+        return Signal.NEUTRAL  # a dropped connection is not the host asking us to slow down
+    if result.status_code in (429, 503):
+        return Signal.THROTTLE
+    if detect_challenge(result.headers, result.text):
+        return Signal.SEVERE
+    return Signal.OK
+
+
+def _report(limiter: LocalRateLimiter, ticket: Ticket, result: Any, stats: CrawlStats) -> None:
+    headers = result.headers or {}
+    retry_after = parse_retry_after(headers.get("retry-after"), headers.get("date"))
+    limiter.report(ticket, _signal_for(result), retry_after_s=retry_after)
+    _sync_limiter_stats(limiter, stats)
 
 
 async def _fetch_page(
@@ -653,21 +772,31 @@ async def _fetch_page(
     depth: int,
     source: str,
     *,
-    gate: HostGate,
+    limiter: LocalRateLimiter,
     stats: CrawlStats,
     limits: CrawlLimits,
     host: str,
     robots: RobotsRules | None = None,
     page_hook: PageHook | None = None,
     is_target: bool = True,
-) -> CrawledPage:
-    """Fetch and reduce one URL. Never raises for anything the network did."""
+    interrupt: Callable[[], bool] | None = None,
+) -> CrawledPage | None:
+    """Fetch and reduce one URL. Never raises for anything the network did.
+
+    -> None when `interrupt` fired before the FIRST request went out: the page was
+    never asked for, so it is not attempted rather than failed. Every request,
+    retries included, waits for its own slot from the limiter and reports what
+    came back, which is how the limiter learns the host's tolerance.
+    """
     page = CrawledPage(
         url=url, depth=depth, discovered_from=source,
         page_type=classify_catalog_url(url) or "", is_target=is_target,
     )
-    await gate.wait()
+    ticket = await limiter.acquire(interrupt)
+    if ticket is None:
+        return None
     result = await get_capped(client, url, max_bytes=MAX_PAGE_BYTES, accept=HTML_ACCEPT)
+    _report(limiter, ticket, result, stats)
 
     # One retry, only for transport failures and 5xx. Never 403 (a WAF decision -
     # retrying escalates) and never 404 (deterministic).
@@ -675,29 +804,32 @@ async def _fetch_page(
                         and result.status_code != 503):
         stats.retries += 1
         await asyncio.sleep(RETRY_DELAY_S)
-        await gate.wait()
-        result = await get_capped(client, url, max_bytes=MAX_PAGE_BYTES, accept=HTML_ACCEPT)
+        ticket = await limiter.acquire(interrupt)
+        if ticket is not None:
+            result = await get_capped(client, url, max_bytes=MAX_PAGE_BYTES, accept=HTML_ACCEPT)
+            _report(limiter, ticket, result, stats)
 
     # Throttling is a separate case with a separate rule: wait and ask again for
-    # the SAME url. The old code recorded a 429 as the page result and moved on,
-    # so a rate-limited host cost us the page AND the crawl.
+    # the SAME url. The wait is the limiter's: the 429 already cut the rate and
+    # paused the host, so the retry simply takes the next slot it is given. There
+    # is no second sleep on top, which is half of what made the old loop so slow.
     for attempt in range(MAX_THROTTLE_RETRIES):
         if result.status_code not in (429, 503):
             break
         stats.throttled += 1
-        gate.back_off(result.headers.get("retry-after"))
-        wait_s = min(_retry_after_seconds(result.headers.get("retry-after")) or gate.interval_s,
-                     MAX_RETRY_AFTER_S)
-        logger.info("throttled by %s (HTTP %s) - waiting %.1fs before retry %d/%d of %s",
-                    host, result.status_code, wait_s, attempt + 1, MAX_THROTTLE_RETRIES, url)
-        await asyncio.sleep(wait_s)
-        await gate.wait()
+        logger.info("throttled by %s (HTTP %s) - retry %d/%d of %s at %.2f req/s",
+                    host, result.status_code, attempt + 1, MAX_THROTTLE_RETRIES, url,
+                    limiter.state.rate)
+        ticket = await limiter.acquire(interrupt)
+        if ticket is None:
+            break  # stopped while waiting: keep the throttled answer we have
         result = await get_capped(client, url, max_bytes=MAX_PAGE_BYTES, accept=HTML_ACCEPT)
+        _report(limiter, ticket, result, stats)
         stats.retries += 1
-    if result.status_code is not None and 200 <= result.status_code < 400:
-        # The host is answering normally again, so stop paying the throttle tax.
-        gate.recover()
 
+    page.fetched_at = datetime.now(UTC)
+    page.etag = (result.headers or {}).get("etag", "")
+    page.last_modified = (result.headers or {}).get("last-modified", "")
     page.status_code = result.status_code
     page.final_url = result.final_url or url
     page.redirect_chain = result.redirect_chain
@@ -736,8 +868,12 @@ async def _fetch_page(
         return page
 
     dom = parse_html(result.text)
+    # Two parses per page in total (this one and the scratch tree inside
+    # extract_texts), down from four plus three full re-serializations. All of
+    # it runs on the event loop, so this is CPU every other worker waits behind.
+    texts = extract_texts(result.text, limits.text_chars)
     facts = extract_page_facts(
-        dom, result.headers, url=page.final_url or url, text_chars=limits.text_chars
+        dom, result.headers, url=page.final_url or url, text_chars=limits.text_chars, texts=texts
     )
     for key, value in facts.items():
         setattr(page, key, value)
@@ -766,7 +902,7 @@ async def _fetch_page(
         # of scope and the page is only its facts. A hook that raises is a bug in
         # the hook, never a reason to lose the page we just paid to fetch.
         try:
-            await page_hook(page, _page_data(result, dom, url, robots))
+            await page_hook(page, _page_data(result, dom, url, robots, visible_text=texts[0]))
         except Exception as exc:  # noqa: BLE001
             logger.warning("page hook failed for %s: %s: %s", url, type(exc).__name__, exc)
     return page
@@ -782,7 +918,14 @@ def _retry_after_seconds(value: str | None) -> float | None:
         return None
 
 
-def _page_data(result: Any, dom: HTMLParser, requested_url: str, robots: RobotsRules | None) -> PageData:
+def _page_data(
+    result: Any,
+    dom: HTMLParser,
+    requested_url: str,
+    robots: RobotsRules | None,
+    *,
+    visible_text: str | None = None,
+) -> PageData:
     """The crawl result as the `PageData` every analyzer already understands.
 
     Built here rather than in the analyzer layer so the contract stays one-way:
@@ -812,6 +955,7 @@ def _page_data(result: Any, dom: HTMLParser, requested_url: str, robots: RobotsR
         fetched_at=datetime.now(UTC),
         robots_txt=robots_txt,
         truncated=result.truncated,
+        visible_text=visible_text,
     )
 
 
@@ -821,7 +965,7 @@ async def collect_site_crawl(
     *,
     robots: RobotsRules | None = None,
     limits: CrawlLimits | None = None,
-    gate: HostGate | None = None,
+    limiter: LocalRateLimiter | None = None,
     page_hook: PageHook | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> SiteCrawlResult:
@@ -840,7 +984,7 @@ async def collect_site_crawl(
         host=host_of(normalized or start_url),
         stats=stats,
     )
-    async for page in crawl_site(client, start_url, robots=robots, limits=limits, gate=gate,
+    async for page in crawl_site(client, start_url, robots=robots, limits=limits, limiter=limiter,
                                  stats=stats, page_hook=page_hook, should_stop=should_stop):
         result.pages.append(page)
     return result

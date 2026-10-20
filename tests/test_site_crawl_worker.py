@@ -65,7 +65,7 @@ def _install_crawl(monkeypatch: pytest.MonkeyPatch, pages: list[CrawledPage], **
     """Stub crawl_site with a generator that yields `pages` and sets `stats`."""
     seen_hooks.clear()
 
-    async def fake_crawl_site(client, start_url, *, robots=None, limits=None, gate=None,
+    async def fake_crawl_site(client, start_url, *, robots=None, limits=None, limiter=None,
                               stats=None, extra_seeds=(), page_hook=None, should_stop=None):
         seen_hooks.append(page_hook)
         for page in pages:
@@ -430,7 +430,7 @@ async def test_stopping_a_crawl_keeps_what_it_already_found(
         saved.extend(records)
         return len(records)
 
-    async def slow_crawl(client, start_url, *, robots=None, limits=None, gate=None,
+    async def slow_crawl(client, start_url, *, robots=None, limits=None, limiter=None,
                          stats=None, extra_seeds=(), page_hook=None, should_stop=None):
         for i in range(10):
             if should_stop is not None and should_stop():
@@ -460,3 +460,123 @@ async def test_stopping_a_crawl_keeps_what_it_already_found(
 
 def test_stopping_a_crawl_that_is_not_running_says_so() -> None:
     assert tasks.request_site_crawl_stop("no-such-crawl") is False
+
+
+# --- catalog-first (Shopify) -----------------------------------------------------------------
+
+
+def _shopify_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def probe(client, url):
+        host = url.split("/")[2]
+        return SiteProbe(start_url=url, origin=f"https://{host}", host=host,
+                         robots=RobotsRules.permissive(), site_name="Shop", is_shopify=True)
+
+    monkeypatch.setattr(tasks, "probe_site", probe)
+
+
+def _capture_crawl(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Stub crawl_site, recording the seeds and limiter it was handed."""
+    seen: dict = {}
+
+    async def fake_crawl_site(client, start_url, *, robots=None, limits=None, limiter=None,
+                              stats=None, extra_seeds=(), page_hook=None, should_stop=None):
+        seen["extra_seeds"] = list(extra_seeds)
+        seen["limiter"] = limiter
+        yield _page(start_url, title="Home", meta_description="d")
+        if stats is not None:
+            stats.fetched = stats.ok = stats.discovered = 1
+
+    monkeypatch.setattr(tasks, "crawl_site", fake_crawl_site)
+    return seen
+
+
+async def test_a_shopify_store_reads_its_catalog_first_and_seeds_the_crawl_with_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from services.site_crawl_catalog import SiteCatalog
+
+    crawl_id = await _new_crawl()
+    _shopify_probe(monkeypatch)
+    seen = _capture_crawl(monkeypatch)
+    saved: list[dict] = []
+    status_during_read: list[str | None] = []
+
+    async def collect(client, probe, *, crawl_id, limiter, should_stop=None, max_products, max_collections):
+        status_during_read.append((await _row(crawl_id)).catalog_status)
+        seen["catalog_limiter"] = limiter
+        return SiteCatalog(
+            products=2, collections=1, complete=True, requests=2, elapsed_s=1.4,
+            gap_counts={"image_alt_missing": 2},
+            urls=[f"{probe.origin}/products/a", f"{probe.origin}/products/b", f"{probe.origin}/collections/c"],
+            records=[{"crawl_id": crawl_id, "kind": "product", "handle": "a"}],
+        )
+
+    async def save_catalog(records):
+        saved.extend(records)
+        return len(records)
+
+    monkeypatch.setattr(tasks, "collect_site_catalog", collect)
+    monkeypatch.setattr(tasks, "save_site_catalog", save_catalog)
+    await tasks.run_site_crawl(crawl_id)
+
+    row = await _row(crawl_id)
+    assert status_during_read == ["reading"]
+    assert row.catalog_status == "complete"
+    assert (row.catalog_products, row.catalog_collections, row.catalog_requests) == (2, 1, 2)
+    assert row.catalog_gaps == {"image_alt_missing": 2}
+    assert len(seen["extra_seeds"]) == 3 and seen["extra_seeds"][2].endswith("/collections/c")
+    # One paced client: the catalog read and the page crawl share a limiter.
+    assert seen["catalog_limiter"] is seen["limiter"]
+    assert saved == [{"crawl_id": crawl_id, "kind": "product", "handle": "a"}]
+    assert any("read 2 products and 1 collections" in n for n in row.notes or [])
+    assert row.status == "complete"
+
+
+async def test_a_store_that_is_not_shopify_has_no_catalog_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawl_id = await _new_crawl()
+    seen = _capture_crawl(monkeypatch)
+
+    async def collect(*args, **kwargs):
+        raise AssertionError("the catalog phase ran for a store that is not on Shopify")
+
+    monkeypatch.setattr(tasks, "collect_site_catalog", collect)
+    await tasks.run_site_crawl(crawl_id)
+
+    row = await _row(crawl_id)
+    assert row.catalog_status is None
+    assert seen["extra_seeds"] == []
+    assert row.status == "complete"
+
+
+async def test_a_failed_catalog_read_never_fails_the_crawl(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawl_id = await _new_crawl()
+    _shopify_probe(monkeypatch)
+    seen = _capture_crawl(monkeypatch)
+
+    async def collect(*args, **kwargs):
+        raise ValueError("garbled JSON")
+
+    monkeypatch.setattr(tasks, "collect_site_catalog", collect)
+    await tasks.run_site_crawl(crawl_id)
+
+    row = await _row(crawl_id)
+    assert row.catalog_status == "unavailable"
+    assert seen["extra_seeds"] == []
+    assert any("crawling from its sitemap instead" in n for n in row.notes or [])
+    assert row.status == "complete"
+
+
+async def test_the_catalog_phase_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    crawl_id = await _new_crawl()
+    _shopify_probe(monkeypatch)
+    seen = _capture_crawl(monkeypatch)
+    monkeypatch.setattr(tasks.get_settings(), "site_crawl_catalog_first", False)
+
+    async def collect(*args, **kwargs):
+        raise AssertionError("the catalog phase ran although it is switched off")
+
+    monkeypatch.setattr(tasks, "collect_site_catalog", collect)
+    await tasks.run_site_crawl(crawl_id)
+
+    assert (await _row(crawl_id)).catalog_status is None
+    assert seen["extra_seeds"] == []

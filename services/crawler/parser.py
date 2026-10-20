@@ -32,6 +32,10 @@ class PageData:
     #: reach per-user integrations (e.g. Search Console credentials). The
     #: fetcher never sets this - workers.tasks attaches it after fetching.
     user_id: str | None = None
+    #: The page's visible text, when the producer already extracted it. The site
+    #: crawl computes it once per page; without this the on_page analyzer would
+    #: re-serialize and re-parse the whole document just to count its words.
+    visible_text: str | None = None
 
 
 def parse_html(html: str) -> HTMLParser:
@@ -60,13 +64,40 @@ def extract_main_text(dom: HTMLParser, max_chars: int = 8000) -> str:
     """Main content text: strips page chrome (nav/footer/etc.) and truncates for LLM prompts."""
     tree = HTMLParser(dom.html or "")
     tree.strip_tags(_NOISE_TAGS + _CHROME_TAGS)
-    text = _text_of(tree)
+    return _truncate_words(_text_of(tree), max_chars)
+
+
+def _truncate_words(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     truncated = text[:max_chars]
     if " " in truncated:
         truncated = truncated.rsplit(" ", 1)[0]
     return truncated
+
+
+def extract_texts(raw_html: str, max_chars: int = 0) -> tuple[str, str]:
+    """-> (visible text, main text) from ONE extra tree, with no re-serialization.
+
+    `visible_text` and `extract_main_text` each serialize the caller's DOM back
+    to a string and parse that string again, because stripping tags mutates the
+    tree and the caller still needs theirs intact. On a 700 KB Shopify page that
+    is three serialize-and-parse round trips per page on the event loop. This
+    parses the raw HTML once into a scratch tree and strips it in two stages:
+    noise tags first (that is the visible text), then page chrome on the same
+    tree (that is the main text). Stripping is cumulative, so the second strip
+    sees exactly what `extract_main_text` would.
+
+    The results match `visible_text` and `extract_main_text`; the difference is
+    only what it costs. `max_chars` 0 skips the main text entirely.
+    """
+    tree = HTMLParser(raw_html or "")
+    tree.strip_tags(_NOISE_TAGS)
+    visible = _text_of(tree)
+    if max_chars <= 0:
+        return visible, ""
+    tree.strip_tags(_CHROME_TAGS)
+    return visible, _truncate_words(_text_of(tree), max_chars)
 
 
 # --- Shared DOM lookups ---------------------------------------------------------

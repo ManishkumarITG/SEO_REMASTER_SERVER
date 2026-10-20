@@ -12,6 +12,7 @@ reduced to its facts the moment it is parsed, and the markup is dropped.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -44,6 +45,14 @@ class CrawledPage(BaseModel):
     content_type: str = ""
     redirect_chain: list[str] = Field(default_factory=list)
     elapsed_ms: float = 0.0
+    #: When the response for this URL arrived. Per page, unlike the Mongo batch
+    #: timestamp, so a crawl's real throughput and stalls can be read back
+    #: afterwards instead of inferred from 25-page batches.
+    fetched_at: datetime | None = None
+    #: Validators the server sent, kept so a later crawl can ask "has this
+    #: changed?" with a conditional GET instead of downloading the page again.
+    etag: str = ""
+    last_modified: str = ""
     #: True when the body exceeded the page byte cap. Every count below is then
     #: a floor, not a total, and a report can say so instead of quietly lying.
     truncated: bool = False
@@ -163,9 +172,26 @@ class CrawlLimits:
     #: Wall clock for the whole crawl. A slow host must not hold a worker slot
     #: indefinitely, so this is enforced, not advisory.
     deadline_s: float = 10 * 60
+    #: Extra wall clock per page the crawl expects to fetch, so a large site is
+    #: not cut off by a deadline sized for a small one. Applied once the sitemap
+    #: has been read and the frontier size is known: the deadline becomes
+    #: max(deadline_s, expected pages x this), capped by `deadline_max_s`.
+    #: 0 keeps the fixed `deadline_s` (the old behaviour, and the field default).
+    deadline_per_target_s: float = 0.0
+    #: Ceiling on that extended deadline. 0 means no ceiling beyond the formula.
+    deadline_max_s: float = 0.0
     #: Floor between request starts, before robots Crawl-delay raises it. Higher
     #: than the catalog crawl floor: whole pages are heavier than <head>s.
     min_interval_s: float = 0.1
+    #: Starting request rate for the adaptive limiter. None starts at the ceiling
+    #: the floor interval allows, which is how the fixed gate behaved.
+    initial_rate_rps: float | None = None
+    #: Grow the rate x1.25 per second of traffic until the host first pushes back.
+    slow_start: bool = False
+    #: A previous crawl's learned sustainable rate for this host. When set the
+    #: crawl starts there and treats it as known, instead of rediscovering it by
+    #: drawing 429s.
+    known_rate_rps: float | None = None
     include_subdomains: bool = False
     #: Following rel="nofollow" would ignore an explicit instruction from the
     #: site. Off by default; on, it is how you find pages nothing else reaches.
@@ -202,6 +228,30 @@ class CrawlLimits:
         self.concurrency = max(1, int(self.concurrency))
         self.max_navigation_pages = max(0, int(self.max_navigation_pages))
         self.page_types = tuple(dict.fromkeys(self.page_types))  # dedupe, keep order
+        self.deadline_per_target_s = max(0.0, float(self.deadline_per_target_s))
+        self.deadline_max_s = max(0.0, float(self.deadline_max_s))
+        # A non-positive rate is "not set", never "stop sending".
+        if self.initial_rate_rps is not None and self.initial_rate_rps <= 0:
+            self.initial_rate_rps = None
+        if self.known_rate_rps is not None and self.known_rate_rps <= 0:
+            self.known_rate_rps = None
+
+    def effective_deadline_s(self, expected_pages: int) -> float:
+        """The deadline for a crawl expected to fetch `expected_pages` pages.
+
+        Never shorter than `deadline_s`: the extension exists so a 20,000-page
+        store is not cut off by a limit sized for a 500-page one, not to shorten
+        anything.
+        """
+        if self.deadline_per_target_s <= 0 or expected_pages <= 0:
+            return self.deadline_s
+        budget = self.page_budget
+        if budget is not None:
+            expected_pages = min(expected_pages, budget)
+        derived = expected_pages * self.deadline_per_target_s
+        if self.deadline_max_s > 0:
+            derived = min(derived, self.deadline_max_s)
+        return max(self.deadline_s, derived)
 
     @property
     def page_budget(self) -> int | None:
@@ -233,6 +283,14 @@ class CrawlLimits:
         }
         if hasattr(settings, "site_crawl_deadline_s"):
             mapped["deadline_s"] = float(settings.site_crawl_deadline_s)  # type: ignore[attr-defined]
+        for field_name in ("deadline_per_target_s", "deadline_max_s"):
+            if hasattr(settings, f"site_crawl_{field_name}"):
+                mapped[field_name] = float(getattr(settings, f"site_crawl_{field_name}"))
+        if getattr(settings, "site_crawl_initial_rate_rps", None):
+            # A configured starting rate is a cautious one by intent, so it grows
+            # from there rather than holding still until the first 429.
+            mapped["initial_rate_rps"] = float(settings.site_crawl_initial_rate_rps)  # type: ignore[attr-defined]
+            mapped["slow_start"] = True
         mapped.update(overrides)
         return cls(**mapped)  # type: ignore[arg-type]
 
@@ -265,6 +323,9 @@ class CrawlStats:
     max_depth_seen: int = 0
     frontier_peak: int = 0
     seeded_from_sitemap: int = 0
+    #: Catalog URLs (Shopify JSON) admitted to the frontier. They are queued
+    #: before the sitemap, so a page in both is credited here, not twice.
+    seeded_from_catalog: int = 0
     #: Pages matching the page-type filter - the ones the crawl was asked for.
     targets: int = 0
     #: Pages fetched only to find links, under a page-type filter. Reported so a
@@ -278,6 +339,19 @@ class CrawlStats:
     #: pages, the rest were rate-limited" is a sentence the UI can say.
     throttled: int = 0
     gave_up_throttled: int = 0
+    #: Distinct rate-limit EPISODES. Several 429s from one burst are one episode;
+    #: this, not `throttled`, is how often the host actually pushed back.
+    throttle_episodes: int = 0
+    #: Seconds of host-wide pause those episodes imposed.
+    throttle_pause_s: float = 0.0
+    #: The limiter's rate right now (req/s), for live progress.
+    current_rate_rps: float = 0.0
+    #: The sustainable rate the host showed us, or None when it never pushed back
+    #: and too few requests succeeded to call it a lower bound. Stored per host so
+    #: the next crawl of the same store starts there.
+    learned_rate_rps: float | None = None
+    #: The deadline actually applied, after sizing it to the expected page count.
+    deadline_s: float = 0.0
     #: A person pressed Stop. Distinguished from every other early exit because
     #: it is the only one that is not a limitation to report or work around.
     stopped_by_user: bool = False

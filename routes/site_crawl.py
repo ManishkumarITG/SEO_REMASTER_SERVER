@@ -8,6 +8,8 @@ with the parameter.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, Query, Request, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +18,7 @@ from controller import site_crawl as site_crawl_controller
 from db.session import get_session
 from schemas import (
     ReportEngine,
+    SiteCrawlCatalogResponse,
     SiteCrawlCreatedResponse,
     SiteCrawlCreateRequest,
     SiteCrawlIssue,
@@ -151,6 +154,28 @@ async def get_site_crawl_templates(
     handful of records however large the crawl was.
     """
     return await site_crawl_controller.get_site_crawl_templates(crawl_id, session)
+
+
+@router.get("/{crawl_id}/catalog", response_model=SiteCrawlCatalogResponse)
+async def get_site_crawl_catalog(
+    crawl_id: str,
+    kind: Literal["product", "collection"] | None = Query(default=None),
+    gap: str | None = Query(
+        default=None, max_length=64,
+        description="Only items with this finding, e.g. `image_alt_missing`, `duplicate_name`",
+    ),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=500),
+    session: AsyncSession = Depends(get_session),
+) -> SiteCrawlCatalogResponse:
+    """Every product and collection the crawl read from the store's JSON (Shopify only).
+
+    Available within about a minute of the crawl starting, long before the page
+    crawl finishes: 250 items a request, against one request per page.
+    """
+    return await site_crawl_controller.get_site_crawl_catalog(
+        crawl_id, session, kind=kind, gap=gap, offset=offset, limit=limit
+    )
 
 
 @router.get("/{crawl_id}/export.{fmt}")

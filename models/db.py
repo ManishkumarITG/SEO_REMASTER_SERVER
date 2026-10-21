@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -85,6 +85,51 @@ class RedditCredential(Base):
     comment_karma: Mapped[int | None] = mapped_column(Integer, nullable=True)
     account_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class ShopifyConnection(Base):
+    """A Shopify store connected through OAuth, one row per (session user, store).
+
+    Never serialized into API responses. Both tokens are stored ENCRYPTED
+    (`integrations/shopify/crypto.py`); these columns hold ciphertext, so a copy
+    of seo.db alone does not hand out access to anyone's store.
+
+    `status` is what the UI shows:
+      active                - the token works (as of `last_checked_at`)
+      reauthorize_required  - the refresh token is gone, expired or rejected;
+                              the merchant must reconnect
+      revoked               - Shopify rejected a fresh token: the app was
+                              uninstalled or access was withdrawn
+    """
+
+    __tablename__ = "shopify_connections"
+    __table_args__ = (UniqueConstraint("user_id", "shop_domain", name="uq_shopify_user_shop"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    #: Always `<name>.myshopify.com`, lower case: the only domain OAuth accepts.
+    shop_domain: Mapped[str] = mapped_column(String(255), nullable=False)
+    shop_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    primary_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    plan_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    currency_code: Mapped[str | None] = mapped_column(String(8), nullable=True)
+
+    access_token_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Null for a non-expiring offline token, which has no refresh token.
+    refresh_token_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    access_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refresh_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: As Shopify granted them, comma-separated.
+    scopes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    connected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
 

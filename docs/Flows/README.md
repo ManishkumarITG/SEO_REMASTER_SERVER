@@ -22,6 +22,7 @@ hota hai.
 | 06 | [reddit-backlink-flow](06-reddit-backlink-flow.md) | `/auth/reddit/*`, `/api/backlinks/reddit/*` |
 | 07 | [report-and-export-flow](07-report-and-export-flow.md) | `report.html?engine=`, `export.{csv,json}` |
 | 08 | [background-jobs-flow](08-background-jobs-flow.md) | `workers/tasks.py` ke chaaron jobs, reconcile aur reap |
+| 09 | [shopify-connection-flow](09-shopify-connection-flow.md) | `/auth/shopify/*`, `/api/shopify/*` |
 
 ---
 

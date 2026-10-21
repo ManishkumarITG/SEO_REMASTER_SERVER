@@ -112,6 +112,20 @@ class Settings(BaseSettings):
     reddit_min_minutes_between_posts: int = 10
     reddit_dedupe_days: int = 30
 
+    # Shopify store connection (Admin API, OAuth authorization code grant). Empty
+    # client id/secret -> /auth/shopify/* and /api/shopify/* answer 503.
+    shopify_client_id: str = ""
+    shopify_client_secret: str = ""
+    # Must EXACTLY match a redirect URL configured on the app in the Dev Dashboard.
+    shopify_redirect_uri: str = "http://localhost:8000/auth/shopify/callback"
+    # Comma-separated, as Shopify expects them.
+    shopify_scopes: str = "read_products"
+    shopify_api_version: str = "2026-10"
+    # Encrypts stored access and refresh tokens at rest. Any long random string;
+    # changing it makes every stored connection ask to be reconnected. Blank falls
+    # back to SESSION_SECRET, and with neither set Shopify refuses to connect.
+    shopify_token_encryption_key: str = ""
+
     # Store catalog crawler. Discovery is never capped; enrichment (one <head>
     # fetch per item, ~0.2 s each) is, so a 10,000-product store finishes
     # "partial" instead of holding a crawl slot for half an hour.
@@ -200,6 +214,14 @@ class Settings(BaseSettings):
     @property
     def reddit_scope_list(self) -> list[str]:
         return [scope for scope in self.reddit_scopes.split() if scope]
+
+    @property
+    def shopify_configured(self) -> bool:
+        return bool(self.shopify_client_id and self.shopify_client_secret)
+
+    @property
+    def shopify_scope_list(self) -> list[str]:
+        return [scope.strip() for scope in self.shopify_scopes.split(",") if scope.strip()]
 
 
 @lru_cache

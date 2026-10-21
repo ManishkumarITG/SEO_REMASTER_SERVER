@@ -153,6 +153,20 @@ Scopes hardcoded hain: `webmasters.readonly` (read-only).
 
 ---
 
+## Shopify connection
+
+| Key | Default | Matlab |
+|---|---|---|
+| `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET` | `""` | **Blank → `/api/shopify/status` `configured: false`, install `reason=not_configured`** |
+| `SHOPIFY_REDIRECT_URI` | `http://localhost:8000/auth/shopify/callback` | Dev Dashboard ke app mein **exactly** register |
+| `SHOPIFY_SCOPES` | `read_products` | **Comma**-separated (Reddit ke ulat). Badalne par purane connections Reconnect maangte hain |
+| `SHOPIFY_API_VERSION` | `2026-10` | GraphQL Admin API version |
+| `SHOPIFY_TOKEN_ENCRYPTION_KEY` | `""` | Stored tokens ko encrypt karta hai. Blank → `SESSION_SECRET`; dono blank → connect band. **Badalne par har store reconnect** |
+
+Flow: [Flows/09-shopify-connection-flow.md](../Flows/09-shopify-connection-flow.md).
+
+---
+
 ## Store catalog crawler
 
 | Key | Default | Matlab |

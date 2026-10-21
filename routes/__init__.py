@@ -2,10 +2,11 @@
 
 Registration order is preserved exactly as main.py had it: health, audits,
 google_auth, search_console, reddit_auth, backlinks - then stores, appended
-last, then site_crawl. Order matters for path resolution, so keep it. Both
-appends are safe: no existing router has a first-segment path parameter, so
-nothing can shadow `/api/stores/*` or `/api/site-crawls/*`, and neither can
-change resolution for any existing path.
+last, then site_crawl, site_analysis and shopify. Order matters for path
+resolution, so keep it. The appends are safe: no existing router has a
+first-segment path parameter, so nothing can shadow `/api/stores/*`,
+`/api/site-crawls/*`, `/auth/shopify/*` or `/api/shopify/*`, and none of them
+can change resolution for any existing path.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from routes import (
     health,
     reddit_auth,
     search_console,
+    shopify,
     site_analysis,
     site_crawl,
     stores,
@@ -35,6 +37,8 @@ def register_routes(app: FastAPI) -> None:
     app.include_router(stores.router)
     app.include_router(site_crawl.router)
     app.include_router(site_analysis.router)
+    app.include_router(shopify.auth_router)
+    app.include_router(shopify.router)
 
 
 __all__ = [
@@ -45,6 +49,7 @@ __all__ = [
     "reddit_auth",
     "register_routes",
     "search_console",
+    "shopify",
     "site_analysis",
     "site_crawl",
     "stores",

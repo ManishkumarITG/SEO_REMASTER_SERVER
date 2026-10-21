@@ -39,6 +39,13 @@ from schemas.search_console import (
     SearchAnalyticsResponse,
     SearchAnalyticsRow,
 )
+from schemas.shopify import (
+    ShopifyConnectionOut,
+    ShopifyConnectionState,
+    ShopifyProduct,
+    ShopifyProductsResponse,
+    ShopifyStatusResponse,
+)
 from schemas.site_analysis import (
     SiteAnalysisCreatedResponse,
     SiteAnalysisCreateRequest,
@@ -125,6 +132,11 @@ __all__ = [
     "SiteCrawlPageDetail",
     "SiteCrawlPageSort",
     "SiteCrawlPageType",
+    "ShopifyConnectionOut",
+    "ShopifyConnectionState",
+    "ShopifyProduct",
+    "ShopifyProductsResponse",
+    "ShopifyStatusResponse",
     "SiteCrawlPagesResponse",
     "SiteCrawlStatus",
     "SiteCrawlStatusResponse",

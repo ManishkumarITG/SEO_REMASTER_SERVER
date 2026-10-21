@@ -126,6 +126,19 @@ Report/export detail: [report-engine-pipeline.md](report-engine-pipeline.md).
 
 ---
 
+
+## Shopify — `/auth/shopify`, `/api/shopify` → [Flows/09](../Flows/09-shopify-connection-flow.md)
+
+| Method | Path | Kya | Status |
+|---|---|---|---|
+| GET | `/auth/shopify/app` | App URL (Dev Dashboard): frontend ke Shopify section par redirect | 302 |
+| GET | `/auth/shopify/install?shop=&reconnect=` | Shopify permission prompt par redirect | 302 |
+| GET | `/auth/shopify/callback` | HMAC + state + shop check, code exchange, encrypted store | 302 |
+| GET | `/api/shopify/status` | configured? + is session ke connections (token kabhi nahi) | 200 |
+| POST | `/api/shopify/connections/{id}/check` | abhi Admin API call karke status | 200, 404, 429, 502, 503 |
+| GET | `/api/shopify/connections/{id}/products?first=&after=&q=` | products, cursor paging | 200, 401, 403, 404, 429, 502, 503 |
+| POST | `/api/shopify/connections/{id}/disconnect` | credentials delete | 200, 404 |
+
 ## Query parameter cheat-sheet
 
 | Param | Endpoints | Bounds / values |
